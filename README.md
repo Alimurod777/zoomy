@@ -23,7 +23,9 @@ Zoomy uses Playwright to join a Zoom web client session on a virtual display (Xv
   → Bot waits for first audio on the virtual sink (parec RMS check)
   → FFmpeg x11grab + PulseAudio null sink → libx264 MP4
   → Bot watches DOM for meeting-end signal
-  → On end/stop: saves MP4 to /recordings, notifies Telegram + screenshot
+  → On end/stop: leaves via Zoom's Leave button, saves MP4 to /recordings, notifies Telegram
+  → Uploads the MP4 to YouTube (unlisted), sends the link; Whisper transcription runs in parallel
+  → 7 days after a successful upload the whole recording folder is deleted from the server
 ```
 
 ## Bot commands
@@ -85,11 +87,12 @@ Multiple concurrent recordings are supported. Each session gets its own isolated
 | Playwright (Chromium) | Joins Zoom web client, watches for meeting end |
 | Xvfb (per session) | Virtual display — one per active recording |
 | PulseAudio null sink (per session) | Virtual audio device for FFmpeg capture |
-| FFmpeg x11grab + pulse | Screen + audio → MP4 (libx264, yuv420p, faststart) |
+| FFmpeg x11grab + pulse | Screen + audio → fragmented MP4 (libx264, yuv420p), playable even if FFmpeg is killed mid-recording |
 | python-telegram-bot v22 | Telegram bot interface |
 | faster-whisper | Local speech-to-text transcription (CPU, int8) |
 | ChatGPT Codex via CLIProxyAPI | AI meeting summary with optional ChatGPT web search |
-| FileBrowser Quantum | Public share links for recordings (bypasses Telegram's 50MB upload cap) |
+| YouTube Data API v3 | Uploads each recording to the owner's channel; local copy expires after 7 days |
+| FileBrowser Quantum | Public share links for recordings (bypasses Telegram's 50MB upload cap); disabled by default, `FILEBROWSER_ENABLED=true` to enable |
 
 ## Project structure
 
@@ -191,7 +194,7 @@ docker compose up -d --build
 
 ### 5. Access recordings
 
-Recordings are available via the `recordings/` bind mount, through FileBrowser Quantum at port `7011` (browse everything, admin login required), or as an individual **Share Link** sent by the bot (public, no login, no folder browsing — see below).
+Each finished recording is uploaded to YouTube and the bot sends the link (see *YouTube upload* below). The files also stay on the server in the `recordings/` bind mount for 7 days after a successful upload, and are browsable through FileBrowser Quantum at port `7011` (admin login required). Per-file **Share Link** buttons exist but are disabled by default (see *Share Link*).
 
 ## Signed-in join
 
@@ -428,6 +431,23 @@ FFmpeg starts with a `-vf crop=1920:{h}:0:{chrome_height}` filter baked in — a
 Example: chrome = 90px → `crop=1920:1110:0:90` → output is 1920×1110  
 Example: chrome = 120px → `crop=1920:1080:0:120` → output is 1920×1080
 
+## Auto-deploy
+
+Baboon is only reachable over Tailscale, so GitHub can't push to it. Instead Baboon pulls: a cron job runs [`deploy/auto-deploy.sh`](deploy/auto-deploy.sh) every minute, and when `origin/main` has a new commit it resets the checkout and runs `docker compose up -d --build`. So the whole deploy is `git push`.
+
+One-time setup on Baboon (turns `~/docker/zoomy` into a checkout of this repo; `.env`, `secrets/`, `cli-proxy/` and `recordings/` are gitignored and stay as they are):
+
+```bash
+cd ~/docker/zoomy
+git init -b main && git remote add origin https://github.com/irchamaji/zoomy.git
+git fetch origin && git reset --hard origin/main
+(crontab -l 2>/dev/null; echo "* * * * * $HOME/docker/zoomy/deploy/auto-deploy.sh >> $HOME/docker/zoomy/deploy.log 2>&1") | crontab -
+```
+
+- Logs: `~/docker/zoomy/deploy.log` (only written when a deploy happens).
+- A commit that fails to build is attempted once, not every minute. Fix and push again, or run `deploy/auto-deploy.sh --force`.
+- Secrets that live outside git (`.env`, `secrets/zoom_state.json`, `youtube_login` state) still need `scp` — see *Signed-in join*.
+
 ## Notes
 
 - Requires Docker with `shm_size: 2gb` (set in `docker-compose.yml`) for Chromium stability
@@ -438,6 +458,11 @@ Example: chrome = 120px → `crop=1920:1080:0:120` → output is 1920×1080
 - Displayed duration is measured from the moment FFmpeg starts (not browser join) and excludes paused time, so it stays consistent with the file size across `/peek` and the hourly notice
 - The hourly "still running" notice and the silence warning both include a live screenshot, like `/peek`
 - FFmpeg encodes at CRF 26, `veryfast` preset, 24fps — balanced quality/size for meeting content
+- Recordings are written as fragmented MP4, so a killed FFmpeg (crash, OOM, forced stop) still leaves a playable file up to the last few seconds instead of an unreadable one with no index
+- On `docker stop` / `docker compose up -d --build` the bot stops live recordings and finalizes them first (`stop_grace_period: 90s` in `docker-compose.yml`, `SHUTDOWN_GRACE_SECS` default 75). Those recordings are saved but not auto-transcribed or uploaded to YouTube; transcribe from `/history`. Still avoid rebuilding mid-meeting — the recording ends at that point
+- On `/stop` the bot stops encoding, then clicks Zoom's **Leave → Leave Meeting** before closing the browser, so its name leaves the participant list right away instead of lingering until Zoom times the dropped connection out. Only the exact "Leave Meeting" button is clicked (never "End Meeting for All"). If Zoom's markup changes and the button isn't found, it logs `Could not leave via the Leave button` and falls back to closing the browser
+- On a successful start the bot sends "✅ Zoomy Ready" to `OWNER_TELEGRAM_ID`
+- `/peek` screenshots are sent as JPEG with a 60s upload timeout, so a slow uplink no longer makes them time out
 - Invalid meeting links (error 3001, expired, etc.) are detected on join and reported immediately
 - Meetings that require a signed-in Zoom account (guest join rejected → "Sign in to join this meeting") are detected on join; the recording is aborted with a notification instead of hanging
 - AI Summary calls retry automatically (exponential backoff, up to 3 attempts) on transient CLIProxyAPI 408/429/5xx errors before surfacing a failure to the user

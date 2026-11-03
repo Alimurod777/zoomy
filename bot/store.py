@@ -42,6 +42,15 @@ class SessionStore:
         """Active (is_recording=True) sessions for this user only."""
         return [s for s in self._sessions.get(user_id, []) if s.recorder.is_recording]
 
+    def all_active(self) -> list:
+        """Active sessions across ALL users."""
+        return [
+            s
+            for sessions in self._sessions.values()
+            for s in sessions
+            if s.recorder.is_recording
+        ]
+
     def total_active(self) -> int:
         """Total active sessions across ALL users."""
         return sum(

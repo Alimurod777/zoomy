@@ -651,6 +651,13 @@ class ZoomRecorder:
                         pass
 
                 self._auto_ended = not self._stop_event.is_set()
+                if not self._auto_ended:
+                    # Stop encoding first so the video ends at /stop rather than
+                    # on the leave dialog, then leave properly: killing Chrome
+                    # outright leaves the bot's name in the participant list
+                    # until Zoom times the dead connection out (minutes).
+                    await asyncio.to_thread(self._stop_ffmpeg)
+                    await self._leave_meeting(page)
                 await browser.close()
 
         except Exception as exc:
@@ -699,6 +706,39 @@ class ZoomRecorder:
 
     async def stop(self) -> None:
         self._stop_event.set()
+
+    async def _leave_meeting(self, page: Page) -> bool:
+        """Click Leave → Leave Meeting so Zoom drops the bot from the roster now.
+
+        Best effort: the Zoom web client's markup can change, so any failure is
+        logged and the caller just closes the browser as before. Returns whether
+        the leave was confirmed. Only the exact "Leave Meeting" button is ever
+        clicked — a host's popup also offers "End Meeting for All".
+        """
+        async def _click_through() -> None:
+            # The toolbar auto-hides until the pointer moves.
+            await page.mouse.move(960, 600)
+            leave = page.locator(
+                "button.footer__leave-btn, button[aria-label='Leave' i], button[title='Leave' i]"
+            ).first
+            await leave.click(timeout=3_000)
+            confirm = page.get_by_role("button", name=re.compile(r"^\s*Leave Meeting\s*$", re.I)).first
+            await confirm.click(timeout=3_000)
+            try:
+                await leave.wait_for(state="hidden", timeout=5_000)
+            except Exception:
+                await asyncio.sleep(1.0)   # let the leave request go out before the browser dies
+
+        try:
+            if page.is_closed():
+                return False
+            await asyncio.wait_for(_click_through(), timeout=15)
+        except Exception as e:
+            logger.warning("Could not leave via the Leave button (%s: %s) — closing the browser instead",
+                           type(e).__name__, str(e).splitlines()[0] if str(e) else "")
+            return False
+        logger.info("Left the meeting via the Leave button")
+        return True
 
     # ------------------------------------------------------------------
 
@@ -1450,7 +1490,11 @@ class ZoomRecorder:
             # stacked underneath (e.g. the "meeting is recorded" notice).
             await self._handle_breakout_invite(page)
             await self._dismiss_blocking_dialogs(page)
-            await asyncio.sleep(3)
+            # Poll every 3s, but wake at once on /stop instead of finishing the nap.
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                pass
 
     _RESOLUTION_SCALE = {
         "360p": "640:360",
@@ -1488,7 +1532,10 @@ class ZoomRecorder:
             cmd += ["-vf", vf]
         cmd += [
             "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
+            # Fragmented MP4: the index is written as the recording goes instead
+            # of once at the end. A killed ffmpeg (container stop, crash, OOM)
+            # then leaves a playable file, not one without a moov atom.
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
             output,
         ]
         log_path = Path(output).parent / ".ffmpeg.log"

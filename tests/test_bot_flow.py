@@ -222,7 +222,7 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_help_and_ongoing_are_registered(self):
         app = Mock()
         builder = Mock()
-        builder.token.return_value.post_init.return_value.build.return_value = app
+        builder.token.return_value.post_init.return_value.post_stop.return_value.build.return_value = app
         with patch.object(bot.Application, 'builder', return_value=builder):
             bot.main()
         commands = set()
@@ -256,7 +256,7 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_youtube_retry_callback_is_registered_and_single_use(self):
         app = Mock()
         builder = Mock()
-        builder.token.return_value.post_init.return_value.build.return_value = app
+        builder.token.return_value.post_init.return_value.post_stop.return_value.build.return_value = app
         with patch.object(bot.Application, 'builder', return_value=builder):
             bot.main()
         patterns = [c.args[0].pattern.pattern for c in app.add_handler.call_args_list
@@ -267,6 +267,139 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         await bot.cb_yt_retry(self.update, self.context)
         self.query.answer.assert_awaited_once()
         self.assertTrue(self.query.answer.call_args.kwargs.get('show_alert'))
+
+    async def test_zoomy_ready_is_sent_to_owner_on_start(self):
+        app = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=AsyncMock()))
+        with patch.object(bot, '_spawn_transcription_worker'), \
+             patch.object(bot, '_restore_schedules', AsyncMock()), \
+             patch.object(bot, '_cleanup_stale_wavs'), \
+             patch.object(bot, '_spawn_background', lambda coro: coro.close()):
+            await bot._post_init(app)
+        app.bot.send_message.assert_awaited_once_with(bot.OWNER_TELEGRAM_ID, '\u2705 Zoomy Ready')
+
+    async def test_ready_message_failure_does_not_break_startup(self):
+        app = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=AsyncMock(side_effect=OSError('down'))))
+        with patch.object(bot, '_spawn_transcription_worker'), \
+             patch.object(bot, '_restore_schedules', AsyncMock()), \
+             patch.object(bot, '_cleanup_stale_wavs'), \
+             patch.object(bot, '_spawn_background', lambda coro: coro.close()):
+            await bot._post_init(app)
+
+    async def test_shutdown_stops_live_recordings_and_waits_for_them(self):
+        finished = []
+
+        async def stop():
+            finished.append('stop')
+
+        async def run():
+            await asyncio.sleep(0)
+            finished.append('finalized')
+
+        task = asyncio.create_task(run())
+        recorder = types.SimpleNamespace(is_recording=True, stop=stop)
+        bot.store._sessions[7] = [types.SimpleNamespace(session_num=1, recorder=recorder, task=task)]
+        bot._shutting_down = False
+        try:
+            await bot._post_stop(None)
+            self.assertTrue(bot._shutting_down)
+            self.assertEqual(finished, ['stop', 'finalized'])
+        finally:
+            bot._shutting_down = False
+
+    async def test_shutdown_with_no_recordings_is_a_noop(self):
+        bot._shutting_down = False
+        try:
+            await bot._post_stop(None)
+            self.assertTrue(bot._shutting_down)
+        finally:
+            bot._shutting_down = False
+
+    async def test_peek_sends_a_small_jpeg_with_a_generous_upload_timeout(self):
+        recorder = types.SimpleNamespace(
+            display=':99', recording_prefix='Daily', current_url='https://zoom.us/j/1',
+            elapsed_str=lambda: '1m', file_size_str=lambda: '1 MB')
+        session = types.SimpleNamespace(session_num=1, recorder=recorder)
+        sent = types.SimpleNamespace(send_photo=AsyncMock(return_value='msg'), send_message=AsyncMock())
+
+        def fake_ffmpeg(cmd, **kw):
+            Path(cmd[-1]).write_bytes(b'jpeg')
+            return types.SimpleNamespace(returncode=0, stderr=b'')
+
+        with patch.object(bot.subprocess, 'run', side_effect=fake_ffmpeg) as run:
+            result = await bot._send_peek(session, 7, sent)
+        self.assertEqual(result, 'msg')
+        cmd = run.call_args.args[0]
+        self.assertTrue(cmd[-1].endswith('.jpg'))
+        self.assertIn('-q:v', cmd)
+        self.assertGreaterEqual(sent.send_photo.call_args.kwargs['write_timeout'], 30)
+
+    def test_recorder_writes_fragmented_mp4_so_a_killed_ffmpeg_leaves_a_playable_file(self):
+        recorder = bot.ZoomRecorder(display=':99', sink='virtual_99.monitor')
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(bot.subprocess, 'Popen') as popen:
+            recorder._start_ffmpeg(str(Path(d) / 'x.mp4'), 0)
+            cmd = popen.call_args.args[0]
+            recorder._ffmpeg_log.close()
+        flags = cmd[cmd.index('-movflags') + 1]
+        self.assertIn('frag_keyframe', flags)
+        self.assertIn('empty_moov', flags)
+        self.assertNotIn('faststart', flags)
+
+    def _leave_page(self, confirm_click=None, leave_click=None):
+        button = lambda click: types.SimpleNamespace(  # noqa: E731
+            click=click or AsyncMock(), wait_for=AsyncMock())
+        leave, confirm = button(leave_click), button(confirm_click)
+        page = types.SimpleNamespace(
+            is_closed=lambda: False,
+            mouse=types.SimpleNamespace(move=AsyncMock()),
+            locator=Mock(return_value=types.SimpleNamespace(first=leave)),
+            get_by_role=Mock(return_value=types.SimpleNamespace(first=confirm)),
+        )
+        return page, leave, confirm
+
+    async def test_leave_meeting_clicks_leave_then_leave_meeting(self):
+        recorder = bot.ZoomRecorder(display=':99', sink='virtual_99.monitor')
+        page, leave, confirm = self._leave_page()
+        self.assertTrue(await recorder._leave_meeting(page))
+        leave.click.assert_awaited_once()
+        confirm.click.assert_awaited_once()
+
+    async def test_leave_meeting_only_ever_matches_the_exact_leave_meeting_button(self):
+        recorder = bot.ZoomRecorder(display=':99', sink='virtual_99.monitor')
+        page, _, _ = self._leave_page()
+        await recorder._leave_meeting(page)
+        pattern = page.get_by_role.call_args.kwargs['name']
+        self.assertTrue(pattern.match('Leave Meeting'))
+        for other in ('End Meeting for All', 'End Meeting', 'Leave', 'Leave Meeting for all'):
+            self.assertIsNone(pattern.match(other), other)
+
+    async def test_leave_meeting_failure_falls_back_without_raising(self):
+        recorder = bot.ZoomRecorder(display=':99', sink='virtual_99.monitor')
+        page, _, confirm = self._leave_page(leave_click=AsyncMock(side_effect=TimeoutError('no button')))
+        self.assertFalse(await recorder._leave_meeting(page))
+        confirm.click.assert_not_awaited()
+
+    async def test_leave_meeting_skips_a_closed_page(self):
+        recorder = bot.ZoomRecorder(display=':99', sink='virtual_99.monitor')
+        page, leave, _ = self._leave_page()
+        page.is_closed = lambda: True
+        self.assertFalse(await recorder._leave_meeting(page))
+        leave.click.assert_not_awaited()
+
+    async def test_watch_loop_wakes_immediately_on_stop(self):
+        recorder = bot.ZoomRecorder(display=':99', sink='virtual_99.monitor')
+        page = types.SimpleNamespace(
+            is_closed=lambda: False, url='https://app.zoom.us/wc/1/join',
+            evaluate=AsyncMock(return_value=''))
+        with patch.object(recorder, '_handle_breakout_invite', AsyncMock()), \
+             patch.object(recorder, '_dismiss_blocking_dialogs', AsyncMock()):
+            task = asyncio.create_task(recorder._watch_meeting(page))
+            await asyncio.sleep(0.1)
+            self.assertFalse(task.done())
+            started = asyncio.get_running_loop().time()
+            await recorder.stop()
+            await asyncio.wait_for(task, timeout=1)
+            self.assertLess(asyncio.get_running_loop().time() - started, 1)
 
 
 if __name__ == '__main__':

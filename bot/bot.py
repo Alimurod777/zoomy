@@ -1256,6 +1256,16 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
 
     async def on_stopped(filename: str, duration: str, size: str, auto_ended: bool = False) -> None:
         folder = Path(filename).parent.name
+        if _shutting_down:
+            # The process is about to exit, so the transcription queue and the
+            # YouTube upload could not finish. Say so rather than promise them.
+            await bot.send_message(
+                chat_id,
+                f"⚠️ Bot is restarting — Session {session_num} recording was cut short and saved.\n"
+                f"Folder: {folder}\nDuration: {duration}\nSize: {size}\n\n"
+                f"Not uploaded to YouTube. Transcribe it from /history if needed.",
+            )
+            return
         reason = "Meeting ended by host" if auto_ended else "Stopped manually"
         session_key = str(session_num)
         _pending_transcriptions[session_key] = filename
@@ -1724,13 +1734,15 @@ async def _send_peek(session: RecordingSession, chat_id: int, bot):
     or None on any failure.
     """
     display = session.recorder.display
-    tmp_path = Path(f"/tmp/peek_{chat_id}_{session.session_num}.png")
+    # JPEG, not PNG: a 1920x1200 desktop PNG is several MB, which over a slow
+    # uplink blew through Telegram's upload timeout and the peek never arrived.
+    tmp_path = Path(f"/tmp/peek_{chat_id}_{session.session_num}.jpg")
     try:
         result = subprocess.run(
             [
                 "ffmpeg", "-y",
                 "-f", "x11grab", "-i", display,
-                "-vframes", "1",
+                "-vframes", "1", "-q:v", "5",
                 str(tmp_path),
             ],
             capture_output=True,
@@ -1749,7 +1761,7 @@ async def _send_peek(session: RecordingSession, chat_id: int, bot):
             f"🔗 {url}"
         )
         with open(tmp_path, "rb") as f:
-            return await bot.send_photo(chat_id, photo=f, caption=caption)
+            return await bot.send_photo(chat_id, photo=f, caption=caption, write_timeout=60)
     except subprocess.TimeoutExpired:
         await bot.send_message(chat_id, f"Session {session.session_num}: screenshot timed out.")
     except Exception as e:
@@ -3437,6 +3449,36 @@ async def _post_init(application: Application) -> None:
     await _restore_schedules(application.bot)
     _cleanup_stale_wavs()
     _spawn_background(_retention_loop())
+    try:
+        await application.bot.send_message(OWNER_TELEGRAM_ID, "✅ Zoomy Ready")
+    except Exception as e:
+        logger.warning("Could not send the ready message: %s", e)
+
+
+# docker stop gives the container stop_grace_period (docker-compose.yml) before
+# SIGKILL; stay under it so recordings are finalized, not killed mid-write.
+SHUTDOWN_GRACE_SECS = int(os.environ.get("SHUTDOWN_GRACE_SECS", "75"))
+_shutting_down = False
+
+
+async def _post_stop(application: Application) -> None:
+    """Finish live recordings before the process exits (docker stop / rebuild).
+
+    Without this, ffmpeg dies with the container and the recording is cut off
+    without ever being finalized. Runs after PTB stopped polling but before its
+    HTTP client closes, so the "recording saved" notices can still be sent.
+    """
+    global _shutting_down
+    _shutting_down = True
+    sessions = store.all_active()
+    if not sessions:
+        return
+    logger.info("Shutdown: finishing %d live recording(s)", len(sessions))
+    for s in sessions:
+        await s.recorder.stop()
+    _, pending = await asyncio.wait([s.task for s in sessions], timeout=SHUTDOWN_GRACE_SECS)
+    if pending:
+        logger.warning("Shutdown: %d recording(s) did not finish within %ds", len(pending), SHUTDOWN_GRACE_SECS)
 
 
 def _cleanup_stale_wavs() -> None:
@@ -3457,7 +3499,10 @@ def _cleanup_stale_wavs() -> None:
 
 
 def main() -> None:
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
+    app = (
+        Application.builder().token(TELEGRAM_TOKEN)
+        .post_init(_post_init).post_stop(_post_stop).build()
+    )
     app.add_error_handler(_error_handler)
     app.add_handler(MessageHandler(filters.ALL, _guard_unauthorized), group=-1)
     app.add_handler(CallbackQueryHandler(_guard_callback), group=-1)
