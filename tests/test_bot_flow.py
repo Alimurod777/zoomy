@@ -26,6 +26,9 @@ with tempfile.TemporaryDirectory() as log_dir:
 
 class BotFlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        manual_setup = patch.dict(os.environ, AUTO_RECORD_SETUP="false")
+        manual_setup.start()
+        self.addCleanup(manual_setup.stop)
         bot.store = bot.SessionStore()
         for state in (bot._history_state, bot._reschedule_state, bot._pending_summary_context,
                       bot._summary_conversations, bot._scheduled):
@@ -57,6 +60,37 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         await bot.cmd_record(self.update, self.context)
         self.assertEqual(bot.store.get_pending(7)['url'], 'https://zoom.us/j/97856007427')
         self.assertEqual(bot.store.get_pending(7)['state'], 'input_pwd')
+
+    async def test_auto_setup_starts_from_one_link_without_questions(self):
+        self.context.args = ['https://zoom.us/j/97856007427?pwd=secret']
+        with patch.dict(os.environ, AUTO_RECORD_SETUP="true"), \
+             patch.object(bot, '_launch_recording', new=AsyncMock()) as launch:
+            await bot.cmd_record(self.update, self.context)
+        launch.assert_awaited_once()
+        state = launch.call_args.args[3]
+        self.assertTrue(state['use_profile_name'])
+        self.assertIsNone(state['prefix'])
+        self.assertNotIn('secret', str(self.context.bot.send_message.call_args_list))
+        self.assertFalse(bot.store.has_pending(7))
+
+    async def test_auto_setup_after_record_prompt_also_starts_immediately(self):
+        self.message.text = 'https://zoom.us/j/97856007427?pwd=secret'
+        bot.store.set_pending(7, dict(state='input_url', timeout_task=None))
+        with patch.dict(os.environ, AUTO_RECORD_SETUP="true"), \
+             patch.object(bot, '_launch_recording', new=AsyncMock()) as launch:
+            await bot.msg_handler(self.update, self.context)
+        launch.assert_awaited_once()
+
+    async def test_auto_setup_does_not_duplicate_same_waiting_meeting(self):
+        self.context.args = ['https://zoom.us/j/97856007427?pwd=secret']
+        active = types.SimpleNamespace(url='https://zoom.us/j/97856007427',
+                                      recorder=types.SimpleNamespace(is_recording=True))
+        bot.store._sessions[7] = [active]
+        with patch.dict(os.environ, AUTO_RECORD_SETUP="true"), \
+             patch.object(bot, '_launch_recording', new=AsyncMock()) as launch:
+            await bot.cmd_record(self.update, self.context)
+        launch.assert_not_awaited()
+        self.assertFalse(bot.store.has_pending(7))
 
     async def test_complete_setup_reaches_launch_once(self):
         self.context.args = ['97856007427']

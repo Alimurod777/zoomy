@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="uz">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zoom login</title>
+<style>
+*{box-sizing:border-box}body{margin:0;height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden;background:#101b28;color:#edf4fb;font:14px system-ui}
+.bar{display:flex;align-items:center;gap:8px;padding:7px 12px;flex-wrap:wrap;border-bottom:1px solid #304152;flex-shrink:0}
+.title{font-weight:700;margin-right:6px}.spacer{flex:1}button{font:inherit;padding:8px 12px;border:1px solid #52677d;border-radius:7px;background:#25394e;color:#fff;cursor:pointer;white-space:nowrap}
+button.primary{background:#2267dc;border-color:#3983ff}button:disabled{opacity:.5;cursor:wait}button:focus-visible,input:focus-visible{outline:2px solid #74c0fc;outline-offset:2px}
+#entry{flex:1;min-width:200px;padding:9px 11px;font:16px system-ui;border-radius:7px;border:1px solid #7790a8;color:#132237;background:white}
+.hint{display:flex;align-items:center;gap:10px;padding:6px 12px;min-height:32px;background:#192c40;flex-shrink:0;font-size:13px}
+#phase{background:#324d67;padding:2px 7px;border-radius:5px;white-space:nowrap}#status{overflow-wrap:anywhere}
+#desktop{flex:1;min-height:0;overflow:auto;background:#202830}#desktop:fullscreen{background:#202830}
+#desktop canvas{outline:none}body.hide-entry .entrybar{display:none}
+@media(max-width:700px){.bar{gap:6px;padding:6px}.title{display:none}.bar button{font-size:12px;padding:7px 8px}.entrybar #entry{flex-basis:100%;min-width:0}.hint{padding:5px 7px;font-size:12px}#phase{display:none}}
+</style>
+<header class="bar">
+ <span class="title">Zoom login</span>
+ <button id="size" title="Ekranga mos yoki tabiiy katta o‘lcham">100% kattalashtirish</button>
+ <button id="pan" hidden>Oynani surish</button>
+ <button id="full">To‘liq ekran</button>
+ <button id="tools">Kiritishni yashirish</button>
+ <span class="spacer"></span>
+ <button id="reload" title="Zoom login sahifasini qaytadan ochish">Login boshiga</button>
+ <button id="save" class="primary">✓ Loginni saqlash</button>
+</header>
+<form class="bar entrybar" id="entry-form" autocomplete="off">
+ <input id="entry" type="text" name="login-text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Email, parol yoki kodni bu yerga yozing" aria-label="Zoom maydoniga kiritiladigan matn">
+ <button id="visibility" type="button" aria-pressed="false">Matnni yashirish</button>
+ <button id="type" type="button">Kiritish</button>
+ <button id="advance" type="submit" class="primary">Kiritish + Enter ↵</button>
+ <button id="enter" type="button" title="Zoom oynasida Enter bosish">Enter ↵</button>
+</form>
+<div class="hint" role="status" aria-live="polite"><span id="phase">Ulanish</span><span id="status">Brauzerga ulanmoqda…</span></div>
+<main id="desktop" aria-label="Zoom brauzer oynasi"></main>
+<script type="module">
+import RFB from './assets/core/rfb.js';
+const $=selector=>document.querySelector(selector),field=$('#entry');
+const ws=new URL('./websockify',location.href);ws.protocol=location.protocol==='https:'?'wss:':'ws:';
+const rfb=new RFB($('#desktop'),ws.href,{credentials:{password:__PASSWORD__}});
+rfb.scaleViewport=true;rfb.resizeSession=false;rfb.clipViewport=false;
+rfb.qualityLevel=6;rfb.compressionLevel=2;
+let connected=false,saved=false,holdUntil=0,timer=null,resizeTimer=null,lastSize='';
+function message(text,hold=0){$('#status').textContent=text;holdUntil=Date.now()+hold;}
+async function request(name,data){
+ const response=await fetch('./'+name,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});
+ const result=await response.json();
+ if(response.status===410){connected=false;clearInterval(timer);}
+ message(result.message||'Amal yakunlandi.',5000);return result;
+}
+async function poll(){
+ if(!connected||saved||document.hidden)return;
+ try{
+  const response=await fetch('./status');if(!response.ok)return;
+  const result=await response.json();
+  $('#phase').textContent=({email:'Email',password:'Parol',code:'Tasdiqlash kodi',manual:'Zoom'})[result.phase]||'Zoom';
+  if(Date.now()>holdUntil)message(result.message);
+ }catch(e){}
+}
+async function fitBrowser(){
+ if(!connected||saved)return;
+ const box=$('#desktop').getBoundingClientRect(),width=Math.max(500,Math.min(1280,Math.floor(box.width))),height=Math.max(520,Math.min(960,Math.floor(box.height)));
+ const size=width+'x'+height;if(size===lastSize)return;
+ try{const response=await fetch('./viewport',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({width,height})});const result=await response.json();if(result.ok)lastSize=size;}catch(e){}
+}
+new ResizeObserver(()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(fitBrowser,400);}).observe($('#desktop'));
+rfb.addEventListener('connect',()=>{connected=true;message('Zoom oynasidagi kerakli maydonni bosing, so‘ng matn kiriting.');fitBrowser();poll();timer=setInterval(poll,3500);});
+rfb.addEventListener('disconnect',()=>{connected=false;clearInterval(timer);if(!saved)message('Ulanish yopildi. Havola eskirgan bo‘lsa botdan yangisini oling.');});
+$('#size').onclick=()=>{
+ const fit=!rfb.scaleViewport;rfb.scaleViewport=fit;rfb.clipViewport=!fit;rfb.dragViewport=false;
+ $('#size').textContent=fit?'100% kattalashtirish':'Ekranga moslash';$('#pan').hidden=fit;$('#pan').textContent='Oynani surish';
+};
+$('#pan').onclick=()=>{
+ rfb.dragViewport=!rfb.dragViewport;$('#pan').textContent=rfb.dragViewport?'Bosish rejimiga qaytish':'Oynani surish';
+ message(rfb.dragViewport?'Oynani sichqoncha yoki barmoq bilan suring. Maydonni bosish uchun bosish rejimiga qayting.':'Endi Zoom maydonlarini bosishingiz mumkin.',5000);
+};
+$('#full').onclick=async()=>{
+ try{if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen();}
+ catch(e){message('Brauzeringizning to‘liq ekran rejimidan foydalaning.',5000);}
+};
+$('#tools').onclick=()=>{const hide=document.body.classList.toggle('hide-entry');$('#tools').textContent=hide?'Kiritishni ko‘rsatish':'Kiritishni yashirish';};
+$('#visibility').onclick=()=>{const hidden=field.type==='text';field.type=hidden?'password':'text';$('#visibility').textContent=hidden?'Matnni ko‘rsatish':'Matnni yashirish';$('#visibility').setAttribute('aria-pressed',String(hidden));};
+async function insert(enter){
+ if(!field.value){message('Avval yuqoridagi maydonga matn yozing.',5000);field.focus();return;}
+ $('#type').disabled=$('#advance').disabled=true;
+ try{const result=await request('type',{text:field.value,replace:true,enter});if(result.ok)field.value='';}
+ catch(e){message('Matn yuborilmadi. Ulanishni tekshirib qayta bosing.',5000);}
+ finally{$('#type').disabled=$('#advance').disabled=false;}
+}
+$('#type').onclick=()=>insert(false);
+$('#entry-form').onsubmit=e=>{e.preventDefault();insert(true);};
+$('#enter').onclick=()=>request('enter').catch(()=>message('Ulanishni tekshiring.',5000));
+$('#save').onclick=async()=>{
+ $('#save').disabled=true;
+ try{const result=await request('save');if(result.ok){saved=true;clearInterval(timer);field.value='';$('#save').textContent='✓ Saqlandi';}}
+ catch(e){message('Saqlash yakunlanmadi. Qayta urinib ko‘ring.',5000);}
+ finally{if(!saved)$('#save').disabled=false;}
+};
+$('#reload').onclick=()=>request('reload').catch(()=>message('Ulanishni tekshiring.',5000));
+</script>
+</html>

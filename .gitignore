@@ -27,6 +27,7 @@ __pycache__/
 *.pyd
 .venv/
 venv/
+.runtime/
 
 # claude code local settings
 .claude/

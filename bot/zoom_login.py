@@ -12,6 +12,13 @@ Run it on a machine with a screen (your laptop), not inside the container:
     python3 bot/zoom_login.py                       # → secrets/zoom_state.json
     python3 bot/zoom_login.py -o /tmp/zoom.json     # somewhere else
 
+On a server without a physical screen, after scripts/setup-runtime.sh:
+
+    source scripts/runtime-env.sh
+    python bot/zoom_login.py --remote
+
+The temporary private noVNC desktop is reached through an SSH tunnel.
+
 then copy the file to the server's `secrets/` directory and restart the stack.
 
 The login is deliberately manual: Zoom answers scripted credential entry with
@@ -23,10 +30,12 @@ The output file is a live login — treat it like a password. It is written
 """
 
 import argparse
-import json
-import os
+import asyncio
 import sys
 from pathlib import Path
+from remote_desktop import remote_desktop
+from auth_store import AuthStore, validate_state
+from zoom_profile import PROFILE_NAME_JS, clean_profile_name
 
 try:
     from playwright.sync_api import sync_playwright
@@ -55,6 +64,10 @@ def main() -> int:
         "--url", default=SIGNIN_URL,
         help=f"sign-in page to open (default: {SIGNIN_URL}; use your org's SSO URL if needed)",
     )
+    ap.add_argument("--remote", action="store_true", help="Login through a private noVNC virtual desktop over SSH")
+    ap.add_argument("--display", type=int, default=90)
+    ap.add_argument("--web-port", type=int, default=6080)
+    ap.add_argument("--vnc-port", type=int, default=5901)
     args = ap.parse_args()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -66,7 +79,7 @@ def main() -> int:
     print("  3. Leave the browser open and come back here.")
     print()
 
-    with sync_playwright() as pw:
+    with remote_desktop(args.remote, args.display, args.web_port, args.vnc_port), sync_playwright() as pw:
         browser = pw.chromium.launch(headless=False, args=BROWSER_ARGS)
         ctx = browser.new_context(viewport={"width": 1280, "height": 900})
         page = ctx.new_page()
@@ -103,6 +116,9 @@ def main() -> int:
             return 1
 
         state = ctx.storage_state()
+        profile_name = clean_profile_name(page.evaluate(PROFILE_NAME_JS))
+        if profile_name:
+            state["profile"] = {"display_name": profile_name}
         browser.close()
 
     cookies = [c for c in state.get("cookies", []) if "zoom.us" in c.get("domain", "")]
@@ -110,17 +126,31 @@ def main() -> int:
         print("Signed in, but no zoom.us cookies were captured. Nothing saved.")
         return 1
 
-    args.output.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    os.chmod(args.output, 0o600)
+    async def persist():
+        store = AuthStore(path=args.output)
+        try:
+            return await store.save(validate_state(state))
+        finally:
+            await store.close()
+
+    try:
+        result = asyncio.run(persist())
+    except Exception as exc:
+        print(f"Could not persist the session ({type(exc).__name__}). Check MongoDB configuration.")
+        return 1
 
     print()
-    print(f"Saved {len(cookies)} zoom.us cookies → {args.output}")
+    print(f"Saved {len(cookies)} zoom.us cookies; MongoDB={result['mongo']}, local_cache={result['cached']}")
     print("This file is a live login — do not commit or share it.")
     print()
-    print("Next: copy it to the server's secrets/ directory and rebuild:")
-    print("  docker compose up -d --build")
+    if args.remote:
+        print("Next: start (or restart) the bot with bash scripts/run.sh")
+    else:
+        print("Next: copy it to the server's secrets/ directory and restart the bot.")
     return 0
 
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / '.env', override=True)
     raise SystemExit(main())

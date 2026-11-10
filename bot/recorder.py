@@ -11,11 +11,19 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
 
-import randomname
-
 from playwright.async_api import async_playwright, Page
+from auth_store import auth_store
+from meeting_state import classify_meeting, SNAPSHOT_JS
+from zoom_profile import profile_name_from_page
 
 logger = logging.getLogger(__name__)
+
+class MeetingJoinError(RuntimeError):
+    pass
+
+
+class DesktopRequired(MeetingJoinError):
+    pass
 
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "/recordings"))
 GUEST_NAME = os.environ.get("GUEST_NAME", "zoomy.ircham.dev")
@@ -108,9 +116,10 @@ def build_web_client_url(url: str) -> str:
 # ── Display pool ──────────────────────────────────────────────────────────────
 
 class DisplayPool:
-    def __init__(self, base: int = 99, max_slots: int = 5):
+    def __init__(self, base: int = 99, max_slots: int = 5, screen_size: str = "1920x1200"):
         self._base = base
         self._max = max_slots
+        self._screen_size = screen_size
         self._lock = asyncio.Lock()
         self._procs: dict[int, subprocess.Popen] = {}  # display_num → Xvfb proc
 
@@ -138,13 +147,15 @@ class DisplayPool:
                     proc = subprocess.Popen(
                         [
                             "Xvfb", f":{n}",
-                            "-screen", "0", "1920x1200x24",
-                            "-ac", "+extension", "GLX", "+render", "-noreset",
+                            "-screen", "0", f"{self._screen_size}x24",
+                            "-nolisten", "tcp", "-ac", "+extension", "GLX", "+render", "-noreset",
                         ],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
                     await asyncio.sleep(1)
+                    if proc.poll() is not None:
+                        raise RuntimeError(f"Xvfb could not start on :{n}")
                     sink = f"virtual_{n}"
                     try:
                         subprocess.run(
@@ -456,6 +467,7 @@ class ZoomRecorder:
         on_silence_cleared: Optional[Callback] = None,
         on_breakout: Optional[Callback] = None,
         on_breakout_result: Optional[Callback] = None,
+        use_profile_name: bool = True,
     ):
         self.display = display
         self.user_id = user_id
@@ -465,6 +477,9 @@ class ZoomRecorder:
         self.sink = sink
         self.sink_name = sink[: -len(".monitor")] if sink.endswith(".monitor") else sink
         self.guest_name = guest_name
+        self.use_profile_name = use_profile_name
+        self._admission_notice = None
+        self._reconnect_count = 0
         self.recording_prefix = recording_prefix
         self.resolution = resolution
         self.meeting_password = meeting_password
@@ -498,6 +513,7 @@ class ZoomRecorder:
         # A pause finalizes the current segment; resume starts a new one. All
         # segments are concatenated into output_path when the recording ends.
         self._chrome_height: int = 0
+        self._capture_bounds: Optional[dict] = None
         self._segments: list[Path] = []
         self._paused: bool = False
         self._paused_total: float = 0.0          # accumulated paused seconds
@@ -553,21 +569,22 @@ class ZoomRecorder:
     async def record(self, url: str) -> None:
         self.is_recording = True
         self.current_url = url
-        self._stop_event.clear()
+        if self._stop_event.is_set():
+            self.is_recording = False
+            return
         self._start_time = time.monotonic()
         self._started_at = datetime.now()
 
         try:
+            mode = (os.getenv("ZOOM_JOIN_MODE") or "auto").lower()
+            if mode not in {"auto", "web", "desktop"}:
+                raise ValueError("ZOOM_JOIN_MODE must be auto, web or desktop")
+            if mode == "desktop":
+                await self._record_native(url)
+                return
             web_url = build_web_client_url(url)
 
-            if not self.recording_prefix:
-                self.recording_prefix = randomname.get_name()
-            datestamp = datetime.now().strftime("%Y%m%d")
-            recording_dir = _reserve_recording_dir(self.recording_prefix, datestamp)
-            self.output_path = recording_dir / f"{self.recording_prefix}.mp4"
-
             logger.info("Joining %s (display=%s)", web_url, self.display)
-            logger.info("Output: %s", self.output_path)
 
             # Pin this session's Chrome to its own display *and* its own audio
             # sink. Without PULSE_SINK every Chrome plays into PulseAudio's
@@ -598,21 +615,32 @@ class ZoomRecorder:
                         "--autoplay-policy=no-user-gesture-required",
                         "--disable-blink-features=AutomationControlled",
                         "--start-maximized",
+                        "--window-position=0,0",
                         "--window-size=1920,1200",
                     ],
                 )
                 # storage_state=None is Playwright's "fresh context" default,
                 # so an absent session file simply means the old guest join.
-                zoom_state = _load_zoom_state()
+                # MongoDB is authoritative when configured. Read just before
+                # joining so other servers' new browser logins are picked up.
+                zoom_state = await auth_store.load() if auth_store.configured else _load_zoom_state()
                 self._signed_in = zoom_state is not None
+                if isinstance(zoom_state, str):
+                    zoom_state = json.loads(Path(zoom_state).read_text())
+                if self._signed_in and self.use_profile_name and isinstance(zoom_state, dict):
+                    self.guest_name = zoom_state.get("profile", {}).get("display_name") or self.guest_name
                 ctx = await browser.new_context(
                     no_viewport=True,
                     permissions=["microphone", "camera"],
-                    storage_state=zoom_state,
+                    storage_state=({k: v for k, v in zoom_state.items() if k in ("cookies", "origins")}
+                                   if isinstance(zoom_state, dict) else zoom_state),
+                    locale="en-US",
                 )
                 page = await ctx.new_page()
 
-                await self._join_meeting(page, web_url)
+                if not await self._join_meeting(page, web_url):
+                    return
+                await self._prepare_recording_view(page)
                 # Measure browser chrome height for cropping
                 try:
                     chrome_height = await page.evaluate(
@@ -625,9 +653,15 @@ class ZoomRecorder:
 
                 await self._wait_for_audio(page)
 
-                if self._session_errored:
+                if self._session_errored or self._stop_event.is_set():
                     return
 
+                if not self.recording_prefix:
+                    self.recording_prefix = await self._automatic_recording_name(page, url)
+                datestamp = datetime.now().strftime("%Y%m%d")
+                recording_dir = _reserve_recording_dir(self.recording_prefix, datestamp)
+                self.output_path = recording_dir / f"{self.recording_prefix}.mp4"
+                await self._configure_capture_bounds(page)
                 self._chrome_height = chrome_height
                 self._segments = [self.output_path]
                 self._ffmpeg = self._start_ffmpeg(str(self.output_path), chrome_height)
@@ -640,26 +674,45 @@ class ZoomRecorder:
                 if self.on_started:
                     await self.on_started(str(self.output_path))
 
-                silence_task = asyncio.create_task(self._silence_monitor())
-                try:
-                    await self._watch_meeting(page)
-                finally:
-                    silence_task.cancel()
+                outcome = "stopped"
+                while not self._stop_event.is_set():
+                    silence_task = asyncio.create_task(self._silence_monitor())
                     try:
-                        await silence_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                        outcome = await self._watch_meeting(page)
+                    finally:
+                        silence_task.cancel()
+                        await asyncio.gather(silence_task, return_exceptions=True)
+                    if outcome not in {"disconnected", "waiting_room", "waiting_host"}:
+                        break
+                    recovered = await self._recover_connection(page, web_url, waiting_room=outcome == "waiting_room")
+                    if recovered is None:
+                        outcome = "connection_failed"
+                        break
+                    page = recovered
 
-                self._auto_ended = not self._stop_event.is_set()
+                self._auto_ended = outcome == "ended"
                 if not self._auto_ended:
                     # Stop encoding first so the video ends at /stop rather than
                     # on the leave dialog, then leave properly: killing Chrome
                     # outright leaves the bot's name in the participant list
                     # until Zoom times the dead connection out (minutes).
                     await asyncio.to_thread(self._stop_ffmpeg)
+                    try:
+                        await page.evaluate("window.__zoomyRecordingView?.stop()")
+                    except Exception:
+                        pass
                     await self._leave_meeting(page)
                 await browser.close()
 
+        except DesktopRequired:
+            # Playwright has closed before native Zoom takes the same display
+            # and sink. No simultaneous duplicate participant/audio capture.
+            try:
+                await self._record_native(url)
+            except Exception as exc:
+                self._session_errored = self._session_errored or self.output_path is None
+                if self.on_error:
+                    await self.on_error(str(exc))
         except Exception as exc:
             logger.exception("Recorder failed")
             # Prevent the finalizer from reporting a partially-created output
@@ -806,6 +859,48 @@ class ZoomRecorder:
             logger.warning("_dismiss_blocking_dialogs failed: %s", e)
         finally:
             self._dialog_pending = False
+
+    async def _prepare_recording_view(self, page: Page) -> None:
+        if os.getenv("ZOOM_CLEAN_RECORDING", "true").lower() != "true":
+            return
+        try:
+            script = Path(__file__).with_name("recording_view.js").read_text()
+            await page.evaluate(script)
+            if self._capture_bounds:
+                await page.evaluate("bounds=>window.__zoomyRecordingView.setOutputRegion(bounds)", self._capture_bounds)
+            await page.mouse.move(0, 0)
+            logger.info("Clean recording view enabled: shared screen first, full source preserved")
+        except Exception as exc:
+            if self._capture_bounds:
+                raise RuntimeError("Could not restore the fixed recording area after reconnection") from None
+            logger.warning("Clean recording view unavailable (%s); keeping the complete native view", type(exc).__name__)
+
+    async def _configure_capture_bounds(self, page: Page) -> None:
+        """Match output shape to media; subsequent sources fit inside this area."""
+        if (os.getenv("ZOOM_CLEAN_RECORDING", "true").lower() != "true"
+                or (os.getenv("ZOOM_RECORDING_ASPECT") or "auto").strip().lower() != "auto"):
+            return
+        try:
+            await page.wait_for_function("""() => {
+                const state=window.__zoomyRecordingView?.status();
+                return state?.frames>0 && state?.rectangle?.sourceWidth>1;
+            }""", timeout=4000)
+            geometry = await page.evaluate("""() => ({width:innerWidth,height:innerHeight,
+                media:window.__zoomyRecordingView.status().rectangle})""")
+            available_w, available_h = geometry["width"], geometry["height"]
+            aspect = geometry["media"]["sourceWidth"] / geometry["media"]["sourceHeight"]
+            width = min(available_w, available_h * aspect)
+            height = min(available_h, available_w / aspect)
+            width, height = max(2, int(width) // 2 * 2), max(2, int(height) // 2 * 2)
+            bounds = {"x": (available_w - width) // 2, "y": (available_h - height) // 2,
+                      "width": width, "height": height}
+            # Fit every source into the selected area before trimming only the
+            # unused margins around that area. The source itself is never cut.
+            await page.evaluate("bounds=>window.__zoomyRecordingView.setOutputRegion(bounds)", bounds)
+            self._capture_bounds = bounds
+            logger.info("Recording output follows media aspect: %dx%d; complete content retained", width, height)
+        except Exception as exc:
+            logger.info("Media aspect is not ready (%s); retaining full-view recording", type(exc).__name__)
 
     # ── Breakout-room invite handling ────────────────────────────────────────
 
@@ -1002,8 +1097,12 @@ class ZoomRecorder:
         list_path = self.output_path.parent / ".concat.txt"
         tmp_out = self.output_path.with_name(f"{self.recording_prefix}.merged.mp4")
         try:
+            entries = []
+            for part in parts:
+                escaped = part.as_posix().replace("'", "'\\''")
+                entries.append(f"file '{escaped}'\n")
             list_path.write_text(
-                "".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8"
+                "".join(entries), encoding="utf-8"
             )
             logger.info("Concatenating %d segments → %s", len(parts), self.output_path.name)
             result = subprocess.run(
@@ -1257,10 +1356,32 @@ class ZoomRecorder:
                     last_page_poll = time.monotonic()
                     if not page.is_closed():
                         try:
+                            state = await self._state(page)
+                            if state in {"ended", "removed", "auth_required", "app_required", "invalid", "passcode"}:
+                                self._stop_event.set()
+                                if self.on_error:
+                                    await self.on_error(self._join_error(state))
+                                return
+                            if state in {"disconnected", "waiting_room", "waiting_host"}:
+                                try:
+                                    if not await self._join_meeting(page, build_web_client_url(self.current_url),
+                                                                    resume_waiting_room=state == "waiting_room"):
+                                        return
+                                    await self._prepare_recording_view(page)
+                                except Exception:
+                                    self._stop_event.set()
+                                    if self.on_error:
+                                        await self.on_error("Ovozni kutishda ulanish tiklanmadi. /record bilan qayta boshlang.")
+                                    return
                             await self._handle_breakout_invite(page)
                             await self._dismiss_blocking_dialogs(page)
                         except Exception as e:
                             logger.debug("Pre-recording page poll failed (will retry): %s", e)
+                    else:
+                        self._stop_event.set()
+                        if self.on_error:
+                            await self.on_error("Zoom oynasi yopildi. /record bilan qayta boshlang.")
+                        return
 
                 # Send "waiting" notification only after grace period expires
                 if not notified_waiting and (time.monotonic() - start) >= _NOTIFY_GRACE_SECS:
@@ -1295,14 +1416,234 @@ class ZoomRecorder:
         logger.warning(
             "Sign-in wall hit (signed_in=%s, aborting): %s", self._signed_in, page.url,
         )
-        self._session_errored = True
+        self._session_errored = self._record_start_time is None
         self._stop_event.set()
         if self.on_error:
             await self.on_error(msg)
 
-    async def _join_meeting(self, page: Page, web_url: str) -> None:
-        await page.goto(web_url, wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(3)
+    async def _state(self, page: Page) -> str:
+        if page.is_closed():
+            return "disconnected"
+        if re.search(r"/(signin|login)(?:[/?#]|$)", page.url, re.I):
+            return "auth_required"
+        if page.url.startswith("chrome-error:"):
+            return "disconnected"
+        return classify_meeting(await asyncio.wait_for(page.evaluate(SNAPSHOT_JS), timeout=5))
+
+    async def _wait_or_stop(self, seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _notice_admission(self, state: str) -> None:
+        if self._admission_notice == state:
+            return
+        self._admission_notice = state
+        messages = {
+            "waiting_host": "Konferensiya hali boshlanmagan. Hostni kutyapman; avtomatik qayta tekshiraman. /stop bilan bekor qilishingiz mumkin.",
+            "waiting_room": "Host kiritishini kutyapman (waiting room). Navbatni saqlash uchun sahifa yangilanmaydi. /stop bilan bekor qilish mumkin.",
+            "disconnected": "Ulanish uzildi. Avtomatik qayta ulanishga harakat qilyapman.",
+            "admitted": "Konferensiyaga kirdim. Ovoz va yozuv avtomatik tayyorlanadi.",
+        }
+        if self.on_waiting and state in messages:
+            try:
+                await self.on_waiting(messages[state])
+            except Exception:
+                logger.warning("Could not send admission status notification")
+
+    @staticmethod
+    def _join_error(state: str) -> str:
+        return {
+            "app_required": "Bu konferensiya haqiqiy Zoom desktop ilovasini talab qiladi. Hozirgi bot Zoom Web App orqali ishlaydi.",
+            "passcode": "Meeting passcode noto‘g‘ri yoki yetishmayapti. /record ga pwd parametri bor to‘liq taklif havolasini yuboring.",
+            "invalid": "Konferensiya havolasi noto‘g‘ri yoki eskirgan.",
+            "removed": "Host botni chiqardi yoki kirishni rad etdi. Avtomatik qayta kirish to‘xtatildi.",
+            "ended": "Konferensiya tugagan.",
+            "auth_required": "Zoom sessiyasi qabul qilinmadi. /zoomlogin orqali qayta kiring.",
+        }[state]
+
+    def _join_exception(self, state):
+        if state == "app_required" and (os.getenv("ZOOM_JOIN_MODE") or "auto").lower() == "auto":
+            return DesktopRequired("Zoom desktop ilovasi talab qilindi")
+        return MeetingJoinError(self._join_error(state))
+
+    async def _record_native(self, url):
+        from zoom_desktop import NativeZoom
+        if self._stop_event.is_set():
+            return
+        if self.use_profile_name:
+            state = await auth_store.load() if auth_store.configured else _load_zoom_state()
+            if isinstance(state, str):
+                state = json.loads(Path(state).read_text())
+            if isinstance(state, dict):
+                self.guest_name = state.get("profile", {}).get("display_name") or self.guest_name
+        native = NativeZoom(self.display, self.sink_name, self._stop_event)
+        try:
+            await native.open(url, self.guest_name)
+            if self.on_waiting:
+                await self.on_waiting("Haqiqiy Zoom Desktop orqali kiryapman. Brauzer logini Desktop loginidan alohida.")
+            deadline = time.monotonic() + max(30, int(os.getenv("ZOOM_HOST_WAIT_SECONDS") or "7200"))
+            link_sent = False
+            recovery_since = None
+            paused_for_connection = False
+            unknown_since = time.monotonic()
+            while not self._stop_event.is_set():
+                try:
+                    state = await asyncio.wait_for(native.snapshot(), timeout=25)
+                except (asyncio.TimeoutError, OSError):
+                    state = "disconnected"
+                if self._stop_event.is_set():
+                    break
+                if state in {"ended", "removed", "invalid", "passcode", "app_required"}:
+                    self._auto_ended = state == "ended"
+                    if state != "ended" and self.on_error:
+                        await self.on_error(self._join_error(state))
+                    break
+                if state == "admitted":
+                    unknown_since = time.monotonic()
+                    recovery_since = None
+                    if self.output_path is None:
+                        await native.prepare()
+                        if self._stop_event.is_set():
+                            break
+                        if not self.recording_prefix:
+                            meeting_id, _ = parse_zoom_url(url)
+                            self.recording_prefix = f"Zoom_{meeting_id}_{datetime.now():%H%M%S}"
+                        folder = _reserve_recording_dir(self.recording_prefix, datetime.now().strftime("%Y%m%d"))
+                        self.output_path = folder / f"{self.recording_prefix}.mp4"
+                        # Native pixels cannot use the web canvas renderer. Keep
+                        # the entire frame: never hide content by guessing crops.
+                        self._chrome_height = 0
+                        self._capture_bounds = None
+                        self._segments = [self.output_path]
+                        self._ffmpeg = self._start_ffmpeg(str(self.output_path))
+                        self._record_start_time = time.monotonic()
+                        self._started_at = datetime.now()
+                        if self.on_started:
+                            await self.on_started(str(self.output_path))
+                    elif paused_for_connection:
+                        self._resume_recording()
+                        paused_for_connection = False
+                    try:
+                        await native.clean_shared_view()
+                    except Exception:
+                        logger.warning("Could not hide the native video panel; recording continues")
+                    if self._ffmpeg and not self._paused and self._ffmpeg.poll() is not None:
+                        self._session_errored = True
+                        raise RuntimeError("FFmpeg Desktop yozuvi vaqtida to‘xtadi.")
+                else:
+                    if self.output_path and not self._paused:
+                        await asyncio.to_thread(self.request_pause)
+                        paused_for_connection = True
+                    await self._notice_admission(state)
+                    if not link_sent and time.monotonic() - unknown_since >= 15:
+                        # The native app contains the owner's account, so only
+                        # its owner receives an interactive desktop link.
+                        owner = os.getenv("OWNER_TELEGRAM_ID", "")
+                        if owner and str(self.user_id) == owner and self.on_waiting:
+                            try:
+                                link = await native.control_link()
+                                await self.on_waiting("Desktop’da login yoki kirishni yakunlash uchun (15 daqiqa): " + link)
+                            except Exception:
+                                await self.on_waiting("Desktop boshqaruv havolasi ochilmadi. setup-login-link.sh sozlamalarini tekshiring.")
+                        link_sent = True
+                    if self.output_path or state == "disconnected":
+                        recovery_since = recovery_since or time.monotonic()
+                        if time.monotonic() - recovery_since >= 30:
+                            if self.output_path is None:
+                                raise RuntimeError("Zoom Desktop ishga tushmadi yoki ulanishi tiklanmadi.")
+                            if self.on_error:
+                                await self.on_error("Desktop ulanishi 30 soniyada tiklanmadi. Yozilgan qism saqlandi.")
+                            break
+                    elif state == "connecting" and time.monotonic() - unknown_since >= 900:
+                        raise RuntimeError("Desktop’da kirish tasdiqlanmadi. Login yoki taklif havolasini tekshiring.")
+                if self.output_path is None and time.monotonic() >= deadline:
+                    raise RuntimeError("Desktop’da hostni kutish muddati tugadi.")
+                if await self._wait_or_stop(2):
+                    break
+        finally:
+            # Finalize video before any leave/login UI can enter the recording.
+            await asyncio.to_thread(self._stop_ffmpeg)
+            await native.close()
+
+    async def _join_meeting(self, page: Page, web_url: str, resume_waiting_room: bool = False) -> bool:
+        deadline = time.monotonic() + max(30, int(os.getenv("ZOOM_HOST_WAIT_SECONDS") or "7200"))
+        retry_seconds = max(2, int(os.getenv("ZOOM_JOIN_RETRY_SECONDS") or "30"))
+        failures = 0
+        navigate = not resume_waiting_room
+        attempt_start = time.monotonic()
+        while not self._stop_event.is_set() and time.monotonic() < deadline:
+            if navigate:
+                attempt_start = time.monotonic()
+                try:
+                    # Each attempt finishes within 25 seconds. Waiting for the
+                    # host/admission is a separate, cancellable background state.
+                    opening = asyncio.create_task(self._open_join_page(page, web_url))
+                    stopping = asyncio.create_task(self._stop_event.wait())
+                    try:
+                        done, _ = await asyncio.wait((opening, stopping), timeout=25,
+                                                     return_when=asyncio.FIRST_COMPLETED)
+                        if stopping in done:
+                            return False
+                        if opening not in done:
+                            raise asyncio.TimeoutError()
+                        await opening
+                    finally:
+                        for task in (opening, stopping):
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(opening, stopping, return_exceptions=True)
+                except MeetingJoinError:
+                    raise
+                except (asyncio.TimeoutError, OSError):
+                    pass
+                except Exception:
+                    if self._stop_event.is_set():
+                        return False
+                    state = await self._state(page)
+                    if state in {"auth_required", "invalid", "passcode", "app_required", "removed", "ended"}:
+                        raise self._join_exception(state) from None
+                navigate = False
+            if self._stop_event.is_set():
+                return False
+            try:
+                state = await self._state(page)
+            except Exception:
+                state = "disconnected"
+            if state == "admitted":
+                await self._join_audio(page)
+                await self._notice_admission(state)
+                return True
+            if state in {"auth_required", "invalid", "passcode", "app_required", "removed", "ended"}:
+                raise self._join_exception(state)
+            await self._notice_admission(state)
+            elapsed = time.monotonic() - attempt_start
+            if state == "waiting_room":
+                # Zoom admits this same browser automatically. Reloading would
+                # throw away the participant's place in the host's queue.
+                failures = 0
+            elif state == "waiting_host":
+                if elapsed >= retry_seconds:
+                    navigate = True
+            elif state == "disconnected" or elapsed >= 30:
+                if failures >= int(os.getenv("ZOOM_RECONNECT_ATTEMPTS") or "5"):
+                    raise RuntimeError("Zoom ulanishi tiklanmadi. Saqlangan qism saqlanadi; /record bilan qayta boshlang.")
+                failures += 1
+                if await self._wait_or_stop(min(retry_seconds, 2 ** failures)):
+                    return False
+                navigate = True
+            if await self._wait_or_stop(1):
+                return False
+        if not self._stop_event.is_set():
+            raise RuntimeError("Hostni kutish muddati tugadi. /record bilan yana boshlashingiz mumkin.")
+        return False
+
+    async def _open_join_page(self, page: Page, web_url: str) -> None:
+        await page.goto(web_url, wait_until="domcontentloaded", timeout=18_000)
+        if await self._wait_or_stop(0.5):
+            return
         await self._screenshot(page, "01_initial")
 
         # Detect invalid / expired meeting before doing anything else
@@ -1328,16 +1669,18 @@ class ZoomRecorder:
             await self._abort_signin_required(page)
             return
 
-        for _ in range(4):
-            try:
-                link = page.get_by_text("Join from Your Browser", exact=False)
-                if await link.count() > 0:
-                    await link.first.click()
-                    await asyncio.sleep(2)
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(2)
+        state = await self._state(page)
+        if state in {"admitted", "waiting_host", "waiting_room"}:
+            return
+        if state in {"app_required", "auth_required", "removed", "invalid"}:
+            raise self._join_exception(state)
+        try:
+            link = page.get_by_text("Join from Your Browser", exact=False)
+            if await link.count() > 0 and await link.first.is_visible():
+                await link.first.click(timeout=2000)
+                await self._wait_or_stop(0.5)
+        except Exception:
+            pass
 
         # Fill passcode if provided — passcode and name fields appear on the same form,
         # so just fill the value; the existing name-fill + Join button click handles submission.
@@ -1357,6 +1700,10 @@ class ZoomRecorder:
                         break
                 except Exception:
                     continue
+        elif not parse_qs(urlparse(web_url).query).get("pwd"):
+            passcode = page.locator('input[placeholder*="passcode" i], input[type="password"]')
+            if await passcode.count() and await passcode.first.is_visible():
+                raise MeetingJoinError(self._join_error("passcode"))
 
         NAME_SELECTORS = [
             'input[placeholder="Your Name"]',
@@ -1364,15 +1711,18 @@ class ZoomRecorder:
             'input#inputname',
             'input[data-testid*="name"]',
             'input[class*="name" i]',
-            'input[type="text"]',
+            'input[type="text"]:not([placeholder*="passcode" i]):not([name*="email" i])',
         ]
         name_filled = False
         for sel in NAME_SELECTORS:
             try:
                 el = page.locator(sel).first
                 if await el.count() > 0 and await el.is_visible():
-                    await el.clear()
-                    await el.fill(self.guest_name)
+                    existing = (await el.input_value()).strip()
+                    if self._signed_in and self.use_profile_name and existing:
+                        self.guest_name = existing
+                    else:
+                        await el.fill(self.guest_name, timeout=2000)
                     name_filled = True
                     logger.info("Name filled using: %s", sel)
                     break
@@ -1417,46 +1767,76 @@ class ZoomRecorder:
             except Exception:
                 logger.warning("Join button not found")
 
-        # Wait to leave the /join page — but bail out if the host requires a
-        # signed-in account. Guest join is then rejected and Zoom shows the
-        # "Sign in to join this meeting" wall instead of admitting the bot.
-        entered = False
-        for _ in range(30):
-            if await self._check_signin_required(page):
-                await self._abort_signin_required(page)
-                return
-            if "/join" not in page.url:
-                entered = True
-                logger.info("Entered meeting. URL: %s", page.url)
-                break
-            await asyncio.sleep(1)
-        if not entered:
-            logger.warning("Still on join page — URL: %s", page.url)
-
+    async def _join_audio(self, page: Page) -> None:
         try:
-            audio_btn = page.get_by_text("Join Audio by Computer", exact=False)
+            audio_btn = page.get_by_role("button", name=re.compile(r"join.*(?:computer|audio)|computer audio", re.I))
             if await audio_btn.count() > 0:
-                await audio_btn.first.click(timeout=5_000)
+                await audio_btn.first.click(timeout=2000)
         except Exception:
             pass
-
-        await asyncio.sleep(3)
-
+        for name in (r"^mute(?: my audio)?$", r"^stop video$"):
+            try:
+                button = page.get_by_role("button", name=re.compile(name, re.I))
+                if await button.count() and await button.first.is_visible():
+                    await button.first.click(timeout=1000)
+            except Exception:
+                pass
         await self._dismiss_notifications(page)
-        await asyncio.sleep(1)
-        await self._dismiss_notifications(page)
 
-        await self._screenshot(page, "03_in_meeting")
+    async def _automatic_recording_name(self, page: Page, url: str) -> str:
+        try:
+            title = await page.evaluate("""() => {
+                for(const selector of ['.meeting-info-topic','#meeting-topic','[data-testid="meeting-topic"]']){
+                    const text=document.querySelector(selector)?.textContent?.trim();if(text)return text;
+                }return document.title;
+            }""")
+            title = re.sub(r"\s*[-|]\s*Zoom(?: Workplace| Meeting)?\s*$", "", title or "", flags=re.I).strip()
+            if title.lower() not in {"", "zoom", "zoom meeting", "zoom workplace", "join meeting", "zoom web client"}:
+                name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip(" .")[:80]
+                if name:
+                    return name
+        except Exception:
+            pass
+        meeting_id, _ = parse_zoom_url(url)
+        return f"Zoom_{meeting_id}_{datetime.now():%H%M%S}"
 
-    async def _watch_meeting(self, page: Page) -> None:
-        ended_substrings = [
-            "been ended by host",
-            "been ended by the host",
-            "meeting has ended",
-            "meeting is ended",
-            "host has ended",
-            "removed from this meeting",
-        ]
+    async def _recover_connection(self, page: Page, web_url: str, waiting_room: bool = False):
+        self._reconnect_count += 1
+        if self._reconnect_count > int(os.getenv("ZOOM_RECONNECT_ATTEMPTS") or "5"):
+            if self.on_error:
+                await self.on_error("Qayta ulanish urinishlari tugadi. Yozilgan qism saqlanadi.")
+            return None
+        was_paused = self._paused
+        if not was_paused:
+            await asyncio.to_thread(self.request_pause)
+        await self._notice_admission("disconnected")
+        try:
+            if page.is_closed():
+                page = await page.context.new_page()
+            if not waiting_room and await self._wait_or_stop(5):
+                return None
+            current = await self._state(page)
+            if current in {"ended", "removed", "auth_required", "app_required", "invalid", "passcode"}:
+                raise MeetingJoinError(self._join_error(current))
+            if current != "admitted":
+                if not await self._join_meeting(page, web_url, resume_waiting_room=current == "waiting_room"):
+                    return None
+            await self._prepare_recording_view(page)
+            await self._wait_for_audio(page)
+            if self._stop_event.is_set():
+                return None
+            if not was_paused:
+                self._resume_recording()
+            if self.on_waiting:
+                await self.on_waiting("Ulanish tiklandi. Yozuv davom etyapti; uzilgan oraliq faylga qo‘shilmaydi.")
+            return page
+        except Exception as exc:
+            if self.on_error:
+                await self.on_error(str(exc) if isinstance(exc, RuntimeError) else
+                    "Ulanish tiklanmadi. Shu paytgacha yozilgan qism saqlanadi.")
+            return None
+
+    async def _watch_meeting(self, page: Page) -> str:
         while not self._stop_event.is_set():
             try:
                 # FFmpeg health check — if process exited, encoding stopped
@@ -1469,19 +1849,18 @@ class ZoomRecorder:
                             await self.on_error(f"FFmpeg stopped unexpectedly (code {self._ffmpeg.returncode})")
                     except Exception:
                         logger.exception("on_error callback failed after FFmpeg exit")
-                    return
+                    return "encoder_failed"
 
-                if page.is_closed():
-                    logger.info("Page closed — stopping")
-                    return
-                visible_text = (await page.evaluate("document.body.innerText")).lower()
-                for phrase in ended_substrings:
-                    if phrase in visible_text:
-                        logger.info("Meeting ended detected: '%s'", phrase)
-                        return
+                state = await self._state(page)
+                if state in {"ended", "removed", "app_required", "auth_required", "invalid", "passcode"}:
+                    logger.info("Meeting terminal state: %s", state)
+                    if state != "ended" and self.on_error:
+                        await self.on_error(self._join_error(state))
+                    return state
+                if state in {"disconnected", "waiting_room", "waiting_host"}:
+                    return state
                 if "zoom.us/wc" not in page.url:
-                    logger.info("Left meeting URL: %s", page.url)
-                    return
+                    return "disconnected"
             except Exception as e:
                 logger.debug("Watch loop iteration error (will retry): %s", e)
             # Breakout invites are handled before generic dialog dismissal so the
@@ -1495,6 +1874,7 @@ class ZoomRecorder:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=3)
             except asyncio.TimeoutError:
                 pass
+        return "stopped"
 
     _RESOLUTION_SCALE = {
         "360p": "640:360",
@@ -1507,22 +1887,27 @@ class ZoomRecorder:
 
         Display is 1920×1200. Browser chrome sits at the top (chrome_height px).
         Crop away the chrome rows; output width stays 1920, height is whatever
-        remains (rounded down to even for H.264 — typically ~1080–1200px).
+        remains. An odd final row is padded for H.264 rather than removed.
         """
+        if self._capture_bounds:
+            region = self._capture_bounds
+            return (f"crop={region['width']}:{region['height']}:{region['x']}:"
+                    f"{region['y'] + max(0, chrome_height)}:exact=1,setsar=1")
         crop_y = max(0, chrome_height)
         out_h = 1200 - crop_y
-        out_h -= out_h % 2  # H.264 requires even dimensions
         if out_h <= 0:
             crop_y = 0
             out_h = 1200
         logger.info("Crop filter: 1920x%d at y=%d (chrome=%dpx)", out_h, crop_y, chrome_height)
-        return f"crop=1920:{out_h}:0:{crop_y}" if crop_y > 0 else None
+        # Pad an odd final row instead of throwing away the bottom of the content.
+        return (f"crop=1920:{out_h}:0:{crop_y}:exact=1,pad=1920:ceil(ih/2)*2:0:0:black"
+                if crop_y > 0 else None)
 
     def _start_ffmpeg(self, output: str, chrome_height: int = 0) -> subprocess.Popen:
         cmd = [
             "ffmpeg", "-y",
             "-loglevel", "warning", "-nostats",
-            "-f", "x11grab", "-r", "24", "-s", "1920x1200", "-i", self.display,
+            "-f", "x11grab", "-draw_mouse", "0", "-r", "24", "-s", "1920x1200", "-i", self.display,
             "-f", "pulse", "-i", self.sink,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
             "-pix_fmt", "yuv420p",

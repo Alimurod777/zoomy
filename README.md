@@ -1,6 +1,12 @@
 # Zoomy
 
-A Telegram bot that records Zoom meetings by joining as a browser guest — no Zoom account or host access required.
+[O‘zbekcha loyiha izohi va mahalliy sozlash](docs/setup-uz.md)
+
+For Alwaysdata without root or Docker, use the `venv` and private runtime setup
+in that guide. It includes a temporary noVNC desktop over SSH for Zoom sign-in
+and optional Pyrofork/MTProto uploads with playable MP4 splitting.
+
+A Telegram bot that records Zoom meetings through the Zoom Web App, using a guest or a saved Zoom login. With the optional native Linux client installed, app-only meetings can fall back to Zoom Desktop.
 
 ## Demo
 
@@ -65,6 +71,43 @@ Unknown commands return the getting-started guide. Text outside an active input 
 
 ### `/record` flow
 
+By default, `AUTO_RECORD_SETUP=true`: send `/record <full_invitation_url>` to
+start immediately. The bot preserves the signed-in profile's display name and
+names the recording after the meeting title (or meeting ID and time). Include
+`?pwd=...` in the invitation when a passcode is required.
+
+Each browser setup attempt is bounded to 25 seconds. Waiting for a host or
+admission is separate: `ZOOM_HOST_WAIT_SECONDS=7200` by default, cancellable
+with `/stop`. Host-not-started pages retry every `ZOOM_JOIN_RETRY_SECONDS=30`;
+waiting rooms keep their queue position. Transient disconnects retry up to
+`ZOOM_RECONNECT_ATTEMPTS=5`, preserving and merging recorded segments.
+A host ending the meeting or removing the bot stops the recording.
+
+`ZOOM_JOIN_MODE=auto` first uses the Web App and switches to the official
+Linux Zoom Desktop client on an explicit app-only requirement. Install it with
+`bash scripts/setup-zoom-desktop.sh` after the runtime setup. Use `web` to
+prevent fallback or `desktop` to force the native client when a browser cannot
+identify the restriction. Native support is experimental: admission is checked
+from visible meeting controls, and an open app alone does not start recording.
+
+Desktop login is separate from MongoDB browser cookies and stays in Zoom's local
+profile. Only `OWNER_TELEGRAM_ID` receives a temporary control link for login or
+additional prompts. Native Zoom supports one recording per server user; it uses
+a silent virtual microphone and the session's dedicated audio sink. Native
+recordings preserve the whole frame. The local Zoom preferences use Hide for
+My video, disable Show non-video participants and Keep meeting controls visible,
+and enable full screen and Scale-to-fit for shared content (side-by-side off).
+These preferences were applied in the actual app on this server and persisted
+across restart; new machines/profiles need the same settings in Zoom.
+The recorder parks the pointer away from toolbar edges, waits for auto-hide
+before encoding, and uses View Options → Hide Video Panel when available.
+Full screen is set explicitly using wmctrl, without a toggle shortcut.
+Browser canvas cleaning remains specific to the Web App.
+The native client handles reconnects itself; if admission is lost for 30 seconds,
+the recorded portion is saved and recording stops.
+
+Set `AUTO_RECORD_SETUP=false` for the manual name and scheduling flow below.
+
 1. **URL or Meeting ID** — pass inline or send after the prompt (100s timeout → cancelled)
    - Full URL with password: `https://zoom.us/j/97856007427?pwd=xxx`
    - URL without password: `https://zoom.us/j/97856007427`
@@ -89,6 +132,7 @@ Multiple concurrent recordings are supported. Each session gets its own isolated
 | PulseAudio null sink (per session) | Virtual audio device for FFmpeg capture |
 | FFmpeg x11grab + pulse | Screen + audio → fragmented MP4 (libx264, yuv420p), playable even if FFmpeg is killed mid-recording |
 | python-telegram-bot v22 | Telegram bot interface |
+| Pyrofork (MTProto) | Optional direct video uploads; splits large recordings into playable MP4 parts |
 | faster-whisper | Local speech-to-text transcription (CPU, int8) |
 | ChatGPT Codex via CLIProxyAPI | AI meeting summary with optional ChatGPT web search |
 | YouTube Data API v3 | Uploads each recording to the owner's channel; local copy expires after 7 days |
@@ -105,6 +149,8 @@ zoomy/
 │   ├── summarizer.py     # ChatGPT Codex wrapper (transcript → AI summary)
 │   ├── filebrowser.py    # FileBrowser Quantum API wrapper (public share links)
 │   ├── youtube.py        # YouTube upload + 7-day local retention cleanup
+│   ├── telegram_upload.py # MTProto upload, MP4 splitting, resumable part tracking
+│   ├── remote_desktop.py # Private temporary noVNC desktop for server-side Zoom login
 │   ├── store.py          # SessionStore — per-user in-memory state
 │   ├── zoom_login.py     # One-off helper: save a signed-in Zoom session
 │   ├── youtube_login.py  # One-off helper: authorize YouTube uploads
@@ -198,6 +244,24 @@ Each finished recording is uploaded to YouTube and the bot sends the link (see *
 
 ## Signed-in join
 
+**Login through Telegram:** the configured owner can use `/zoomlogin` in a
+private chat to receive an expiring HTTPS link to the real browser desktop.
+Sign in and complete 2FA in your browser, then click **Loginni saqlash** on
+the page or send `/zoomdone`. The session is verified before persistence.
+Set `ZOOM_LOGIN_MODE=telegram` for the older screenshot/input fallback. `/zoomdone`
+verifies the profile before saving; `/zoomcancel` closes the temporary browser.
+See [setup, MongoDB, and synchronization](docs/setup-uz.md).
+
+When `MONGODB_URI` is set, Zoom browser state is encrypted with
+`MONGODB_AUTH_KEY`, shared under `ZOOM_AUTH_ID`, and fetched before each new
+recording. Passwords and OTP are not persisted. `/zoomsync` pulls the latest
+state; all instances need the same database, identity, and encryption key.
+
+**Server without a physical display:** after the rootless setup in
+[the Alwaysdata guide](docs/setup-uz.md), run `source scripts/runtime-env.sh`
+and `python bot/zoom_login.py --remote`. Open the private noVNC desktop through
+an SSH tunnel to complete sign-in and 2FA in the server's browser.
+
 By default the bot joins anonymously, as a guest. A host can require every participant to be signed in with a Zoom account, and that guest join is then refused:
 
 > Host requires participants to be signed in with a Zoom account — the bot joined as a guest and was refused.
@@ -286,6 +350,13 @@ Zoomy generates structured meeting summaries through ChatGPT Codex, via the priv
 **Reasoning:** summaries request low reasoning effort to keep `gpt-5.6-luna` responsive and preserve ChatGPT subscription quota.
 
 ## Share Link
+
+Direct Telegram delivery is also available through Pyrofork: set
+`TELEGRAM_UPLOAD_ENABLED=true`, `TELEGRAM_API_ID`, and `TELEGRAM_API_HASH`.
+Recordings upload automatically when they finish, or via **Telegram video** in
+`/history`. `TELEGRAM_SPLIT_MB=1900` sets the maximum part size in MiB; larger
+videos are stream-copied into independently playable parts. Failed uploads keep
+the original and can resume from completed parts through `/history`.
 
 Recordings routinely exceed Telegram's 50MB bot-upload limit, so instead of sending the file directly, Zoomy generates a public share link via [FileBrowser Quantum](https://filebrowserquantum.com/).
 
@@ -417,6 +488,19 @@ Schedules persist across bot restarts via `recordings/schedules.json`. On startu
 - **Auto-export transcript** — after transcription, write `.txt` to a mounted Obsidian vault or shared folder
 
 ## Recording crop
+
+With `ZOOM_CLEAN_RECORDING=true` (default), the recorder presents shared media
+above the meeting UI and fits the complete source without cropping or stretching.
+Profile tiles, meeting toolbars and the local mouse pointer are excluded. The
+active camera is used when sharing stops and a camera surface is available.
+With `ZOOM_RECORDING_ASPECT=auto` (default), the output frame follows the initial
+media's aspect ratio, removing only unused outer margins. Portrait media can
+produce portrait MP4s. Later aspect changes are fitted into the same frame so
+no content is cut and pause/resume segments remain compatible. `/peek` uses
+the same framing. Set `ZOOM_RECORDING_ASPECT=original` for a fixed wide view.
+Unrecognized media
+falls back to the complete native view. An odd remaining height is padded to
+an even H.264 dimension rather than dropping the last content row.
 
 Each session runs on a **1920×1200 virtual display** (Xvfb). The extra 120px gives the browser chrome room to exist without eating into meeting content.
 

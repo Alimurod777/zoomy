@@ -32,6 +32,9 @@ import transcriber as transcriber_mod
 import summarizer as summarizer_mod
 import filebrowser as filebrowser_mod
 import youtube as youtube_mod
+import telegram_upload as telegram_upload_mod
+from auth_store import auth_store
+from zoom_auth_bot import zoom_auth_bot
 
 from recorder import ZoomRecorder, _display_pool, SILENT_SNOOZE_SECS, BREAKOUT_AUTOJOIN_SECS
 from store import RecordingSession, SessionStore
@@ -44,6 +47,9 @@ def _setup_logging() -> None:
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
+    # HTTP request URLs include the Telegram token; login payloads stay private.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     console = logging.StreamHandler()
     console.setFormatter(fmt)
@@ -427,7 +433,8 @@ async def _retention_loop() -> None:
         if youtube_mod.is_configured():
             try:
                 await asyncio.to_thread(
-                    youtube_mod.cleanup_expired, RECORDINGS_DIR, store.is_active_folder
+                    youtube_mod.cleanup_expired, RECORDINGS_DIR,
+                    lambda folder: store.is_active_folder(folder) or telegram_upload_mod.is_uploading(Path(folder))
                 )
             except Exception:
                 logger.exception("Retention cleanup failed")
@@ -512,6 +519,8 @@ def _session_label(s: RecordingSession) -> str:
 
 
 def _active_input_flow(user_id: int) -> str | None:
+    if zoom_auth_bot.active(user_id):
+        return "Zoom login"
     if store.has_pending(user_id):
         return "recording setup"
     if user_id in _reschedule_state:
@@ -569,6 +578,11 @@ async def _guard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("This menu has expired. Use the latest prompt or start again.", show_alert=True)
         raise ApplicationHandlerStop
 
+    if data.startswith(("rt_delete", "rt_rename")) and state and state.get("selected_folder"):
+        if telegram_upload_mod.is_uploading(state["selected_folder"]):
+            await query.answer("Wait for the Telegram upload before changing this folder.", show_alert=True)
+            raise ApplicationHandlerStop
+
     # A second input workflow would steal replies from the current one.
     opens_input = data in {"rt_rename", "rt_summarize", "rt_resummarize", "rt_ask_ai"}
     opens_input = opens_input or data.startswith("summarize_txt:") or bool(re.fullmatch(r"reschedule_\d+", data))
@@ -582,6 +596,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """Cancel temporary interaction only; recordings and saved schedules continue."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
+        return
+    if zoom_auth_bot.active(user_id):
+        await zoom_auth_bot.cancel(update, context)
         return
     states = [
         store.pop_pending(user_id),
@@ -669,6 +686,9 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     if active:
+        if os.getenv("AUTO_RECORD_SETUP", "true").lower() == "true":
+            await _auto_start_recording(user_id, update.effective_chat.id, context.bot)
+            return
         lines = "\n".join(f"• {_session_label(s)}" for s in active)
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("Yes, Start", callback_data="confirm_new_session"),
@@ -683,11 +703,30 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                              timeout_task=asyncio.create_task(_confirmation_timeout(user_id, context.bot)))
         return
 
+    if os.getenv("AUTO_RECORD_SETUP", "true").lower() == "true":
+        await _auto_start_recording(user_id, update.effective_chat.id, context.bot)
+        return
     if not has_pwd and platform == "zoom":
         await _ask_meeting_password(user_id, context.bot)
         return
 
     await _send_name_keyboard(user_id, context.bot)
+
+
+async def _auto_start_recording(user_id: int, chat_id: int, bot) -> None:
+    pending = store.get_pending(user_id)
+    meeting = re.search(r"/(?:j|wc)/(\d+)", pending.get("url") or "")
+    for session in store.active(user_id):
+        current = re.search(r"/(?:j|wc)/(\d+)", session.url)
+        if meeting and current and meeting.group(1) == current.group(1):
+            store.pop_pending(user_id)
+            await bot.send_message(chat_id, "Bu konferensiya allaqachon kutilyapti yoki yozilyapti. /ongoing yoki /stop.")
+            return
+    store.update_pending(user_id, use_profile_name=True, prefix=None)
+    await bot.send_message(chat_id,
+        "Havola qabul qilindi. Profil ismi va yozuv nomi avtomatik tanlanadi.\n"
+        "Konferensiya boshlanmagan bo‘lsa kutaman; /stop bilan bekor qilishingiz mumkin.")
+    await _start_recording(user_id, chat_id, bot)
 
 
 async def _url_timeout(user_id: int, bot) -> None:
@@ -922,6 +961,9 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     user_id = update.effective_user.id
+    if zoom_auth_bot.active(user_id):
+        await zoom_auth_bot.text(update, context)
+        return
 
     # Reschedule input takes priority over everything
     if user_id in _reschedule_state:
@@ -957,6 +999,9 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # covers it, since a duplicate always means there's an active session.
         store.update_pending(user_id, url=normalized_url, platform=platform, state=None)
         await update.message.reply_text("✅ Got it.")
+        if os.getenv("AUTO_RECORD_SETUP", "true").lower() == "true":
+            await _auto_start_recording(user_id, update.effective_chat.id, context.bot)
+            return
         if active:
             lines = "\n".join(f"• {_session_label(s)}" for s in active)
             kb = InlineKeyboardMarkup([[
@@ -994,7 +1039,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Use a bot name with 1–80 characters, or /cancel to exit.")
             return
         _cancel_timeout(user_id)
-        store.update_pending(user_id, guest_name=name, state=None)
+        store.update_pending(user_id, guest_name=name, use_profile_name=False, state=None)
         # Typed straight past the keyboard — its buttons are still live, so
         # retire them before they can rewind the step. (In "input_name" the
         # keyboard is already gone: cb_change_name replaced it.)
@@ -1248,7 +1293,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
         folder = Path(filename).parent.name
         await bot.send_message(
             chat_id,
-            f"Recording started — Session {session_num}\nFolder: {folder}",
+            f"Recording started — Session {session_num}\nFolder: {folder}\nZoom ismi: {recorder.guest_name}",
         )
         session = store.find(user_id, session_num)
         if session:
@@ -1266,7 +1311,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
                 f"Not uploaded to YouTube. Transcribe it from /history if needed.",
             )
             return
-        reason = "Meeting ended by host" if auto_ended else "Stopped manually"
+        reason = "Meeting ended by host" if auto_ended else "Recording stopped"
         session_key = str(session_num)
         _pending_transcriptions[session_key] = filename
 
@@ -1303,6 +1348,8 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
             _spawn_background(
                 _youtube_upload_task(bot, chat_id, Path(filename), f"Session {session_num}")
             )
+        if telegram_upload_mod.is_configured() and Path(filename).exists():
+            _spawn_background(_telegram_upload_task(bot, chat_id, Path(filename)))
 
     async def on_error(msg: str) -> None:
         await bot.send_message(chat_id, f"Session {session_num} error: {msg}")
@@ -1318,7 +1365,8 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
         )
 
     async def on_waiting(msg: str) -> None:
-        await bot.send_message(chat_id, f"⏸ Session {session_num} — {msg}")
+        icon = "✅" if any(word in msg for word in ("kirdim", "tiklandi")) else "⏳"
+        await bot.send_message(chat_id, f"{icon} Session {session_num} — {msg}")
 
     async def on_silence_warn(duration: int) -> None:
         name = html.escape(recorder.recording_prefix or "recording")
@@ -1409,6 +1457,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
         sink=sink_monitor,
         user_id=user_id,
         guest_name=guest_name,
+        use_profile_name=p.get("use_profile_name", False),
         recording_prefix=prefix,
         resolution=resolution,
         meeting_password=meeting_password,
@@ -1457,6 +1506,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
         if not task.cancelled() and (exc := task.exception()):
             logger.error("Unhandled exception in session %d task", session_num, exc_info=exc)
 
+    recorder.is_recording = True  # /stop and duplicate protection include admission wait.
     task = asyncio.create_task(run())
     task.add_done_callback(_on_task_done)
     store.add(user_id, RecordingSession(session_num, url, recorder, task, display_num))
@@ -1738,13 +1788,16 @@ async def _send_peek(session: RecordingSession, chat_id: int, bot):
     # uplink blew through Telegram's upload timeout and the peek never arrived.
     tmp_path = Path(f"/tmp/peek_{chat_id}_{session.session_num}.jpg")
     try:
+        command = ["ffmpeg", "-y", "-f", "x11grab", "-draw_mouse", "0",
+                   "-video_size", "1920x1200", "-i", display]
+        build_filter = getattr(session.recorder, "_build_vf", None)
+        if callable(build_filter):
+            vf = build_filter(getattr(session.recorder, "_chrome_height", 0))
+            if vf:
+                command += ["-vf", vf]
+        command += ["-vframes", "1", "-q:v", "5", str(tmp_path)]
         result = subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-f", "x11grab", "-i", display,
-                "-vframes", "1", "-q:v", "5",
-                str(tmp_path),
-            ],
+            command,
             capture_output=True,
             timeout=10,
         )
@@ -2373,6 +2426,8 @@ async def _show_history_actions(message, state: dict) -> None:
         buttons.append([InlineKeyboardButton("🗑 Delete", callback_data="rt_delete")])
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="rt_cancel")])
 
+    if telegram_upload_mod.is_configured() and f.suffix.lower() == ".mp4":
+        buttons.insert(0, [InlineKeyboardButton("📤 Telegram video", callback_data="rt_upload")])
     buttons.insert(-1, [InlineKeyboardButton("◀️ Back to recordings", callback_data=f"rt_page:{state['page']}")])
     await message.edit_text(
         f"📁 {html.escape(folder.name)}\n"
@@ -2381,6 +2436,29 @@ async def _show_history_actions(message, state: dict) -> None:
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="HTML",
     )
+
+
+async def _telegram_upload_task(bot, chat_id: int, path: Path) -> None:
+    try:
+        await telegram_upload_mod.upload_recording(bot, chat_id, path)
+    except Exception:
+        logger.exception("Telegram MTProto upload failed for %s", path.name)
+        await bot.send_message(chat_id,
+            "⚠️ Telegram upload failed. Original recording is kept. "
+            "Retry from /history → Telegram video; completed parts are skipped.")
+
+
+async def cb_rt_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    state = _history_state.get(update.effective_user.id)
+    if not state or not state.get("selected_file"):
+        return
+    path = Path(state["selected_file"])
+    if store.is_active_folder(path.parent) or telegram_upload_mod.is_uploading(path):
+        await context.bot.send_message(query.message.chat_id, "This recording is active or uploading.")
+        return
+    _spawn_background(_telegram_upload_task(context.bot, query.message.chat_id, path))
 
 
 async def cb_rt_retranscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3306,6 +3384,8 @@ _HELP_TEXT = (
     "/history [keyword] — Browse or search recordings by name\n"
     "/cancel — Exit setup or input; recordings keep running\n"
     "/exit — End the AI conversation\n"
+    "/zoomlogin — Owner: Zoom browser login in private chat\n"
+    "/zoomstatus — Owner: saved Zoom auth and MongoDB sync\n"
     "/help — Show this guide"
 )
 
@@ -3444,7 +3524,41 @@ def _spawn_transcription_worker(bot) -> None:
     task.add_done_callback(_on_worker_done)
 
 
+async def cmd_zoom_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await zoom_auth_bot.authorize(update):
+        return
+    flow = _active_input_flow(update.effective_user.id)
+    if flow and flow != "Zoom login":
+        await update.message.reply_text(f"Finish {flow}, or send /cancel first.")
+        return
+    await zoom_auth_bot.start(update, context)
+
+
+_auth_sync_task = None
+
+
+async def _auth_sync_loop() -> None:
+    while True:
+        try:
+            await auth_store.sync()
+        except Exception as exc:
+            # Never include connection strings, encrypted blobs or cookies.
+            logger.warning("Zoom MongoDB auth sync failed (%s)", type(exc).__name__)
+        await asyncio.sleep(max(10, int(os.getenv("ZOOM_AUTH_SYNC_SECONDS", "60"))))
+
+
 async def _post_init(application: Application) -> None:
+    global _auth_sync_task
+    if auth_store.configured:
+        try:
+            await auth_store.sync()
+        except Exception:
+            try:
+                await application.bot.send_message(OWNER_TELEGRAM_ID,
+                    "⚠️ Zoom auth MongoDB bilan sinxronlanmadi. MONGODB_URI va MONGODB_AUTH_KEY ni tekshiring.")
+            except Exception:
+                logger.warning("Could not notify the owner about MongoDB auth sync")
+        _auth_sync_task = asyncio.create_task(_auth_sync_loop())
     _spawn_transcription_worker(application.bot)
     await _restore_schedules(application.bot)
     _cleanup_stale_wavs()
@@ -3470,6 +3584,11 @@ async def _post_stop(application: Application) -> None:
     """
     global _shutting_down
     _shutting_down = True
+    await zoom_auth_bot.close()
+    if _auth_sync_task:
+        _auth_sync_task.cancel()
+        await asyncio.gather(_auth_sync_task, return_exceptions=True)
+    await auth_store.close()
     sessions = store.all_active()
     if not sessions:
         return
@@ -3508,6 +3627,12 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(_guard_callback), group=-1)
     app.add_handler(CommandHandler(["start", "help"], cmd_unknown))
     app.add_handler(CommandHandler("cancel",        cmd_cancel))
+    app.add_handler(CommandHandler("zoomlogin",     cmd_zoom_login))
+    app.add_handler(CommandHandler("zoomdone",      zoom_auth_bot.done))
+    app.add_handler(CommandHandler("zoomcancel",    zoom_auth_bot.cancel))
+    app.add_handler(CommandHandler("zoomclick",     zoom_auth_bot.click))
+    app.add_handler(CommandHandler(["zoomsync", "zoomstatus"], zoom_auth_bot.sync))
+    app.add_handler(CallbackQueryHandler(zoom_auth_bot.callback, pattern=r"^zoomauth:"))
     app.add_handler(CommandHandler("ongoing",       cmd_ongoing))
     app.add_handler(CommandHandler("record",        cmd_record))
     app.add_handler(CommandHandler("stop",          cmd_stop))
@@ -3527,6 +3652,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_rt_send_summary,     pattern="^rt_send_summary$"))
     app.add_handler(CallbackQueryHandler(cb_rt_ask_ai,           pattern="^rt_ask_ai$"))
     app.add_handler(CallbackQueryHandler(cb_rt_share,            pattern="^rt_share$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_upload,           pattern="^rt_upload$"))
     app.add_handler(CallbackQueryHandler(cb_rt_cancel,           pattern="^rt_cancel$"))
     app.add_handler(CallbackQueryHandler(cb_rt_rename,           pattern="^rt_rename$"))
     app.add_handler(CallbackQueryHandler(cb_rt_delete,           pattern="^rt_delete$"))

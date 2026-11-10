@@ -5,7 +5,8 @@ from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
 
-_CPU_THREADS = int(os.environ.get("WHISPER_THREADS", "10"))
+# .env.example intentionally leaves this optional setting empty.
+_CPU_THREADS = int(os.environ.get("WHISPER_THREADS", "").strip() or "10")
 
 # initial_prompt primes Whisper's context window — teaches spelling of domain terms.
 # hotwords boosts probability of specific words during beam search.
