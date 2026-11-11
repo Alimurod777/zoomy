@@ -118,6 +118,16 @@ bo‘shliq paydo bo‘lishi mumkin. Noaniq kadrlarda to‘liq ko‘rinish saqlan
 ishonch yetmasa yoki qayta ishlash xato bersa asl yozuv qoldiriladi. Jarayon
 past ustuvorlikda, cheklangan CPU oqimlari bilan ishlaydi; upload biroz kechikadi.
 `ZOOM_NATIVE_CLEANUP_TIMEOUT=1800` — qayta ishlash chegarasi (soniya).
+Kompyuterda ulashilayotgan ekran kattalashsa, kichraysa yoki boshqa oynaga
+almashsa ham har bir kadrning yangi maydoni olinadi. Manba almashganda
+**Hide Video Panel** yana tekshiriladi. Profil panelini yashirish yozuv
+ko‘rinishiga tegishli; bot akkaunti Zoom qatnashchilari ro‘yxatida ko‘rinadi.
+Konferensiya tugashi tasdiqlansa, yozuv to‘xtaydi. Zoom tugash oynasining
+vaqtinchalik, faqat egasi o‘qiy oladigan namunasi yakuniy videodagi mos
+ortiqcha kadrlarni va audioni olib tashlash uchun ishlatiladi, keyin o‘chiriladi.
+Bu yakunlash kesimi `ZOOM_NATIVE_CLEAN_VIDEO=false` bo‘lganda ham bajariladi.
+Statik slaydlar yozilishi davom etadi. Ekran ulashishni vaqtincha to‘xtatish
+konferensiya tugashi hisoblanmaydi.
 Asosiy tasvir butun kadr bilan saqlanadi. Ushbu serverdagi haqiqiy Zoom
 Settings oynasida quyidagilar sozlandi va ilovani qayta ochganda saqlangani
 tekshirildi (yangi server yoki profil uchun Zoom ichida yana sozlang):

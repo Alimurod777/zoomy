@@ -16,7 +16,36 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from PIL import Image
+from PIL import Image, ImageStat
+
+
+class TerminalMatcher:
+    """Match a confirmed Zoom end window, never infer ending from stillness."""
+    def __init__(self, reference, region):
+        source = Image.open(reference).convert('RGB')
+        width,height = source.size
+        left,top,right,bottom = region
+        if not (0<=left<right<=width and 0<=top<bottom<=height):
+            raise ValueError('Invalid Zoom end-window region')
+        self.box = (math.floor(left*320/width),math.floor(top*200/height),
+                    math.ceil(right*320/width),math.ceil(bottom*200/height))
+        self.reference = self._pixels(source.resize((320,200),Image.Resampling.BOX))
+        sample = source.crop(region).convert('L')
+        self.valid = ImageStat.Stat(sample).stddev[0] >= 12
+        self.ink = [i for i,p in enumerate(self.reference) if min(p)<180 or max(p)-min(p)>40]
+        self.valid = self.valid and len(self.ink)>=64
+
+    def _pixels(self, frame):
+        raw=frame.crop(self.box).resize((96,64),Image.Resampling.BOX).convert('RGB').tobytes()
+        return list(zip(raw[::3],raw[1::3],raw[2::3]))
+
+    def matches(self, frame):
+        if not self.valid:
+            return False
+        pixels = self._pixels(frame)
+        error = sum(sum(abs(a-b) for a,b in zip(p,q)) for p,q in zip(pixels,self.reference))/(len(pixels)*3)
+        ink_matches = sum(max(abs(a-b) for a,b in zip(pixels[i],self.reference[i]))<=35 for i in self.ink)
+        return error<=12 and ink_matches/len(self.ink)>=.9
 
 
 def media_bounds(image):
@@ -30,6 +59,18 @@ def media_bounds(image):
     small = image.convert('RGB').resize((320, 200), Image.Resampling.NEAREST)
     pixels = small.tobytes()
     mask = bytearray(max(pixels[i:i+3]) > 12 for i in range(0, len(pixels), 3))
+    # Zoom's anchored gray header can touch a wide computer share without a
+    # black gap. Remove it only when a short, uniform UI band is identifiable;
+    # a gray source continuing beyond the band limit is left untouched.
+    header_rows = 0
+    for y in range(30):
+        row = [pixels[(y*320+x)*3:(y*320+x)*3+3] for x in range(320)]
+        gray = sum(28 <= min(p) <= max(p) <= 65 and max(p)-min(p)<15 for p in row)
+        if gray/320 < .7:
+            break
+        header_rows += 1
+    if 2 <= header_rows < 30:
+        mask[:header_rows*320] = b'\0'*(header_rows*320)
     candidates = []
     for start in range(len(mask)):
         if not mask[start]:
@@ -72,24 +113,28 @@ def media_bounds(image):
     return (x, y, end_x-x, end_y-y)
 
 
-def clean_recording(path):
+def clean_recording(path, terminal_reference=None, terminal_region=None, keep_full_view=False):
     """Two bounded-memory passes, atomic replace on success only."""
-    info = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                    '-show_entries', 'stream=width,height,r_frame_rate', '-of', 'json', str(path)]))['streams'][0]
+    probe = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                    '-show_entries', 'stream=width,height,r_frame_rate:format=duration', '-of', 'json', str(path)]))
+    info = probe['streams'][0]
     width, height = info['width'], info['height']
     num, den = map(int, info['r_frame_rate'].split('/'))
     fps = num/den
     if not 1 <= fps <= 60 or width % 2 or height % 2:
         return 'unsupported'
+    matcher = TerminalMatcher(terminal_reference,terminal_region or (0,0,width,height)) if terminal_reference else None
+    tail_start = max(0,int((float(probe.get('format',{}).get('duration',0))-30)*fps))
     with tempfile.TemporaryDirectory(prefix='.native-view-', dir=path.parent) as folder:
         output = Path(folder) / 'clean.mp4'
         decoder = subprocess.Popen(['ffmpeg', '-nostdin', '-v', 'error', '-threads', '1', '-filter_threads', '1', '-i', str(path),
-                    '-an', '-vf', 'scale=320:200:flags=neighbor', '-threads', '1',
+                    '-an', '-vf', 'scale=320:200:flags=area', '-threads', '1',
                     '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'], stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL)
         frames = detected = 0
         first = None
         regions = []
+        terminal_start = None
         try:
             while True:
                 raw = decoder.stdout.read(320*200*3)
@@ -98,8 +143,12 @@ def clean_recording(path):
                 if len(raw) != 320*200*3:
                     raise RuntimeError('Incomplete native analysis frame')
                 thumbnail = Image.frombytes('RGB', (320,200), raw)
+                if matcher and frames>=tail_start and matcher.matches(thumbnail):
+                    terminal_start = terminal_start or (frames,detected)
+                else:
+                    terminal_start = None
                 # Scale the padded box back to the actual capture dimensions.
-                box = media_bounds(thumbnail)
+                box = media_bounds(thumbnail) if not keep_full_view else None
                 if box:
                     x,y,w,h = box
                     left = max(0, math.floor(x*width/320/2)*2)
@@ -124,7 +173,11 @@ def clean_recording(path):
                 else:
                     regions.append((frames,box))
                     if len(regions)>256:
-                        return 'uncertain'
+                            if not matcher:
+                                return 'uncertain'
+                            keep_full_view = True
+                            first = None
+                            regions = [(0,(0,0,width,height))]
                 frames += 1
             if decoder.wait() != 0:
                 raise RuntimeError('Native frame analysis failed')
@@ -133,8 +186,16 @@ def clean_recording(path):
             if decoder.poll() is None:
                 decoder.kill()
                 decoder.wait()
-        if not first or not frames or detected / frames < 0.6:
-            return 'uncertain'
+        trimmed = False
+        if terminal_start and 0<terminal_start[0]<frames-1:
+            frames,detected = terminal_start
+            regions = [(start,box) for start,box in regions if start<frames]
+            trimmed = True
+        if not first or not frames or detected / frames < 0.6 or keep_full_view:
+            if not trimmed:
+                return 'uncertain'
+            first = (0,0,width,height)
+            regions = [(0,first)]
         out_w, out_h = first[2:]
         # Encode constant-geometry intervals. Runtime crop-size changes stall
         # downstream scale/pad on some project FFmpeg builds. Every interval
@@ -158,7 +219,7 @@ def clean_recording(path):
         listing.write_text(''.join(f"file '{name}'\n" for name in parts))
         result=subprocess.run(['ffmpeg','-nostdin','-v','error','-y','-f','concat','-safe','0',
             '-i',str(listing),'-i',str(path.resolve()),'-map','0:v:0','-map','1:a?',
-            '-c','copy','-movflags','+faststart',str(output)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+            '-t',f'{frames/fps:.9f}','-c','copy','-movflags','+faststart',str(output)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         if result.returncode or not output.is_file() or output.stat().st_size == 0:
             raise RuntimeError('Native surface encoding failed: ' + result.stderr.decode(errors='replace')[-400:])
         encoded=json.loads(subprocess.check_output(['ffprobe','-v','error','-select_streams','v:0',
@@ -167,7 +228,8 @@ def clean_recording(path):
             raise RuntimeError('Native output frame count or geometry changed unexpectedly')
         os.chmod(output, path.stat().st_mode & 0o777)
         os.replace(output, path)
-        return f'cleaned:{out_w}x{out_h}'
+        return (f'cleaned:{out_w}x{out_h}' + (':end-trimmed' if trimmed else '')
+                + f':duration={frames/fps:.6f}')
 
 
 if __name__ == '__main__':
@@ -184,11 +246,14 @@ if __name__ == '__main__':
             parent_gone(signal.SIGTERM, None)
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=Path)
+    parser.add_argument('--terminal-reference',type=Path)
+    parser.add_argument('--terminal-region',type=lambda value:tuple(map(int,value.split(','))))
+    parser.add_argument('--keep-full-view',action='store_true')
     args = parser.parse_args()
     if hasattr(os, 'nice'):
         os.nice(19)
     try:
-        print(clean_recording(args.path), flush=True)
+        print(clean_recording(args.path,args.terminal_reference,args.terminal_region,args.keep_full_view), flush=True)
     except Exception as exc:
         print(type(exc).__name__, flush=True)
         raise SystemExit(1)

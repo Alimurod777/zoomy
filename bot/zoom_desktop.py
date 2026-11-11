@@ -61,6 +61,9 @@ def native_state(lines, meeting_window=False, previously_admitted=False):
     if state != 'connecting':
         return state
     lower = text.lower()
+    if (previously_admitted and not meeting_window and 'join' in lower
+            and ('sign in' in lower or 'new meeting' in lower or 'schedule' in lower)):
+        return 'ended'
     # A launch/home window or video preview is never proof of admission.
     controls = 'participants' in lower and ('leave' in lower or 'share' in lower)
     if controls or (previously_admitted and meeting_window):
@@ -104,6 +107,36 @@ def blue_audio_buttons(image):
                 and abs((left+right)/2-width/2)<width*.2 and height*.2<top<height*.75):
             boxes.append((left,top,right+1,bottom+1))
     return boxes
+
+
+def transient_parent(display, window):
+    """Read the WM owner of a dialog, independent of its translated title."""
+    import ctypes as c
+    try:
+        xlib=c.CDLL('libX11.so.6')
+        xlib.XOpenDisplay.argtypes=[c.c_char_p]
+        xlib.XOpenDisplay.restype=c.c_void_p
+        xlib.XGetTransientForHint.argtypes=[c.c_void_p,c.c_ulong,c.POINTER(c.c_ulong)]
+        xlib.XCloseDisplay.argtypes=[c.c_void_p]
+        xlib.XSync.argtypes=[c.c_void_p,c.c_int]
+        xlib.XSetErrorHandler.argtypes=[c.c_void_p]
+        xlib.XSetErrorHandler.restype=c.c_void_p
+        connection=xlib.XOpenDisplay(display.encode())
+        if not connection:
+            return None
+        # A popup may close between enumeration and this query. Xlib's default
+        # BadWindow handler exits the entire bot, so contain that normal race.
+        callback=c.CFUNCTYPE(c.c_int,c.c_void_p,c.c_void_p)(lambda _display,_error:0)
+        previous=xlib.XSetErrorHandler(c.cast(callback,c.c_void_p))
+        try:
+            parent=c.c_ulong()
+            return str(parent.value) if xlib.XGetTransientForHint(connection,int(window),c.byref(parent)) else None
+        finally:
+            xlib.XSync(connection,0)
+            xlib.XCloseDisplay(connection)
+            xlib.XSetErrorHandler(previous)
+    except (OSError,ValueError):
+        return None
 
 
 class NativeDesktopLink(BrowserLoginLink):
@@ -201,6 +234,10 @@ class NativeZoom:
         self.audio_dialog_open = False
         self.audio_window_rect = None
         self._last_header_ocr = float('-inf')
+        self._share_signature = None
+        self.terminal_reference = None
+        self._last_screen_png = None
+        self._last_media_bounds = None
         self.env = {**os.environ, 'DISPLAY': display, 'PULSE_SINK': sink,
                     'LIBGL_ALWAYS_SOFTWARE': '1', 'QT_QPA_PLATFORM': 'xcb',
                     'OMP_THREAD_LIMIT': '2', 'OMP_NUM_THREADS': '2',
@@ -271,7 +308,7 @@ class NativeZoom:
 
     async def snapshot(self):
         if self.process and self.process.returncode is not None:
-            return 'disconnected'
+            return 'ended' if self.admitted and self.process.returncode == 0 else 'disconnected'
         window_ids = (await self.command('xdotool', 'search', '--onlyvisible', '--class', 'zoom')).decode().split()
         meeting_window = self.meeting_window_id is not None and self.meeting_window_id in window_ids
         main_candidates = []
@@ -281,7 +318,9 @@ class NativeZoom:
         for wid in window_ids[:20]:
             title = (await self.command('xdotool', 'getwindowname', wid)).decode(errors='replace').strip()
             is_audio = bool(re.search(r'(?:audio conference options|join audio)', title, re.I))
-            if is_audio or title.casefold() == 'zoom':
+            owner = transient_parent(self.display,wid) if self.admitted and wid != self.meeting_window_id else None
+            owned_modal = owner is not None and (owner==self.meeting_window_id or owner in window_ids)
+            if is_audio or title.casefold() == 'zoom' or owned_modal:
                 audio_dialog = audio_dialog or is_audio
                 geometry=(await self.command('xdotool','getwindowgeometry','--shell',wid)).decode()
                 values=dict(re.findall(r'^(X|Y|WIDTH|HEIGHT)=(-?\d+)$',geometry,re.M))
@@ -300,9 +339,14 @@ class NativeZoom:
                 self.meeting_window_id = wid
         # The computer-audio dialog is centered, outside the status margins.
         await self.read_screen(margins_only=self.admitted and meeting_window, extra_regions=popup_regions)
-        self.share_seen = self.share_seen or any(
-            y < 150 and re.search(r"(?:['’]s\s+screen|view options|you are viewing)", label, re.I)
-            for label, _, y in self.lines)
+        signature = next((label.strip().casefold() for label,_,y in self.lines if y < 150
+                          and re.search(r"(?:['’]s\s+screen|you are viewing)",label,re.I)), None)
+        self.share_seen = self.share_seen or signature is not None or any(
+            y < 150 and label.strip().casefold() == 'view options' for label,_,y in self.lines)
+        if signature and signature != self._share_signature:
+            self._share_signature = signature
+            self._share_panel_hidden = False
+            self._last_view_attempt = float('-inf')
         self.audio_dialog_open = audio_dialog
         state_lines = list(self.lines)
         if audio_dialog:
@@ -311,6 +355,12 @@ class NativeZoom:
             await self.click_label("Don't send") or await self.click_label('Don’t send')
             return 'connecting'
         state = native_state(state_lines, meeting_window, self.admitted)
+        if state in {'ended','removed'} and self._last_screen_png:
+            terminal_region = next((rect for rect in popup_regions if classify_meeting(' '.join(
+                label for label,x,y in state_lines if rect[0]<=x<rect[2] and rect[1]<=y<rect[3]))
+                in {'ended','removed'}), None)
+            if terminal_region or not meeting_window:
+                self.terminal_reference = (self._last_screen_png, terminal_region or (0,0,1920,1200))
         if state == 'admitted':
             self.admitted = True
             # Recent Linux clients title the meeting "Zoom Workplace" too.
@@ -334,6 +384,7 @@ class NativeZoom:
         if not image:
             self.lines = []
             return
+        self._last_screen_png = image
         from PIL import Image, ImageOps
         source = Image.open(io.BytesIO(image))
         # Once admitted, OCR only toolbar/status margins while a meeting window
@@ -359,7 +410,7 @@ class NativeZoom:
                                       input=buffer.getvalue(),timeout=12)
             self.lines.extend((label,rect[0]+x//scale,rect[1]+y//scale)
                               for label,x,y in ocr_lines(result.decode(errors='replace')))
-        if not self.share_seen and time.monotonic()-self._last_header_ocr>5:
+        if time.monotonic()-self._last_header_ocr>5:
             self._last_header_ocr=time.monotonic()
             await enhanced(source.crop((0,0,1920,100)),(0,0,1920,100),3)
         if self.audio_window_rect:
@@ -369,6 +420,18 @@ class NativeZoom:
             for box in blue_audio_buttons(region):
                 absolute=(rect[0]+box[0],rect[1]+box[1],rect[0]+box[2],rect[1]+box[3])
                 await enhanced(region.crop(box),absolute,3,psm='7',button=True)
+        for rect in extra_regions:
+            if rect != self.audio_window_rect:
+                await enhanced(source.crop(rect),rect,2)
+        if self.admitted and self.share_seen:
+            from native_video import media_bounds
+            bounds = media_bounds(source)
+            if bounds:
+                old = self._last_media_bounds
+                if old and any(abs(a-b)>max(12,b*.05) for a,b in zip(bounds[2:],old[2:])):
+                    self._share_panel_hidden = False
+                    self._last_view_attempt = float('-inf')
+                self._last_media_bounds = bounds
 
     async def park_pointer(self):
         # The bottom/right edges reveal Zoom's auto-hidden controls. The

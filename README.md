@@ -122,7 +122,9 @@ a silent virtual microphone and the session's dedicated audio sink. Native
 recordings first preserve the whole frame. With `ZOOM_NATIVE_CLEAN_VIDEO=true`
 (default), detected screen shares are framed after recording, before upload.
 Every frame is analyzed so rotations switch the source region without a stale
-portrait crop. A large central surface separated from Zoom's UI by black margins
+portrait crop. Computer shares that resize or touch the Zoom header are also
+handled; source changes re-arm the native Hide Video Panel action. A large
+central surface separated from Zoom's UI by black margins
 is required; ambiguous frames retain the complete view. Toolbars and separate
 side panels are excluded when the main surface is identified. The output keeps
 its initial surface aspect; a later rotation fits the complete source and can
@@ -141,6 +143,12 @@ Full screen is set explicitly using wmctrl, without a toggle shortcut.
 Browser canvas cleaning remains specific to the Web App.
 The native client handles reconnects itself; if admission is lost for 30 seconds,
 the recorded portion is saved and recording stops.
+Confirmed Zoom end dialogs, a return to Home, or a normal app exit finish the
+session. A private reference of a confirmed end dialog can remove the matching
+trailing frames and audio before upload; static slides remain recordable.
+End trimming also runs when native reframing is disabled. Profile and video
+panels are hidden in the recording layout; the recording account remains
+visible in Zoom's participant list.
 
 Set `AUTO_RECORD_SETUP=false` for the manual name and scheduling flow below.
 

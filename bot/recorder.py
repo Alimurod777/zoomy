@@ -7,6 +7,7 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -524,6 +525,8 @@ class ZoomRecorder:
         self._chrome_height: int = 0
         self._capture_bounds: Optional[dict] = None
         self._native_shared_seen = False
+        self._native_terminal_reference = None
+        self._native_final_duration = None
         self._segments: list[Path] = []
         self._paused: bool = False
         self._paused_total: float = 0.0          # accumulated paused seconds
@@ -742,10 +745,12 @@ class ZoomRecorder:
             self._stop_ffmpeg()
             # Concat can be lengthy for big files — keep the loop responsive.
             await asyncio.to_thread(self._finalize_segments)
-            if (self._native_shared_seen and self.output_path and self.output_path.is_file()
-                    and not self._session_errored
-                    and os.getenv('ZOOM_NATIVE_CLEAN_VIDEO', 'true').lower() in {'true','1','yes'}):
+            if (self.output_path and self.output_path.is_file() and not self._session_errored
+                    and (self._native_terminal_reference or (self._native_shared_seen
+                    and os.getenv('ZOOM_NATIVE_CLEAN_VIDEO', 'true').lower() in {'true','1','yes'}))):
                 await self._clean_native_video()
+                if self._native_final_duration is not None:
+                    elapsed = self._native_final_duration
             self.is_recording = False
             self.current_url = None
             self._paused = False
@@ -1667,12 +1672,19 @@ class ZoomRecorder:
         finally:
             # Finalize video before any leave/login UI can enter the recording.
             self._native_shared_seen = getattr(native, 'share_seen', False) is True
+            reference = getattr(native, 'terminal_reference', None)
+            if isinstance(reference,tuple) and len(reference)==2 and isinstance(reference[0],bytes):
+                self._native_terminal_reference = reference
             await asyncio.to_thread(self._stop_ffmpeg)
             await native.close()
 
     async def _clean_native_video(self):
         """Keep full raw capture until a low-priority cleanup worker succeeds."""
         worker = Path(__file__).with_name('native_video.py')
+        terminal_path = None
+        options = []
+        if not self._native_shared_seen or os.getenv('ZOOM_NATIVE_CLEAN_VIDEO','true').lower() not in {'true','1','yes'}:
+            options.append('--keep-full-view')
         if self.on_waiting:
             try:
                 await self.on_waiting('Yozuv tugadi. Asosiy ekran maydoni moslashtirilyapti, keyin fayl yuboriladi.')
@@ -1683,16 +1695,30 @@ class ZoomRecorder:
         except ValueError:
             timeout = 1800
         try:
+            if self._native_terminal_reference:
+                image,region = self._native_terminal_reference
+                fd,name = tempfile.mkstemp(prefix='.zoom-end-',suffix='.png',dir=self.output_path.parent)
+                terminal_path = Path(name)
+                with os.fdopen(fd,'wb') as stream:
+                    stream.write(image)
+                options += ['--terminal-reference',str(terminal_path.resolve()),
+                            '--terminal-region',','.join(map(str,region))]
             proc = await asyncio.create_subprocess_exec(sys.executable, str(worker), str(self.output_path.resolve()),
+                    *options,
                     stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                     env={**os.environ, 'ZOOMY_NATIVE_PARENT_PID': str(os.getpid())}, start_new_session=True)
         except OSError:
+            if terminal_path:
+                terminal_path.unlink(missing_ok=True)
             logger.warning('Native framing worker unavailable; complete original recording retained')
             return
         try:
             output, _ = await asyncio.wait_for(proc.communicate(), timeout)
             if proc.returncode == 0:
                 logger.info('Native shared-screen framing: %s', output.decode().strip())
+                duration = re.search(r':duration=(\d+(?:\.\d+)?)',output.decode())
+                if duration:
+                    self._native_final_duration = float(duration[1])
             else:
                 logger.warning('Native framing failed; complete original recording retained')
         except asyncio.TimeoutError:
@@ -1701,6 +1727,8 @@ class ZoomRecorder:
             if proc.returncode is None:
                 os.killpg(proc.pid, signal.SIGKILL)
                 await proc.wait()
+            if terminal_path:
+                terminal_path.unlink(missing_ok=True)
 
     async def _join_meeting(self, page: Page, web_url: str, resume_waiting_room: bool = False) -> bool:
         deadline = time.monotonic() + max(30, int(os.getenv("ZOOM_HOST_WAIT_SECONDS") or "7200"))

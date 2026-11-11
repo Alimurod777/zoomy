@@ -36,6 +36,7 @@ class DesktopStateTests(unittest.TestCase):
         self.assertEqual(native_state([('Sign in to join this meeting', 0, 0)]), 'auth_required')
         self.assertEqual(native_state([('Video Preview Join', 0, 0)]), 'connecting')
         self.assertEqual(native_state([], meeting_window=True), 'connecting')
+        self.assertEqual(native_state([('Join a meeting Sign in',0,0)],False,True),'ended')
 
     def test_actual_controls_confirm_admission(self):
         self.assertEqual(native_state([('Participants Share Leave', 0, 0)]), 'admitted')
@@ -203,6 +204,65 @@ class NativeViewTests(unittest.IsolatedAsyncioTestCase):
         self.app.read_screen.assert_awaited_once_with(margins_only=True,extra_regions=[(674,380,1246,802)])
         self.app.join_computer_audio.assert_awaited_once_with(refresh=False)
 
+    async def test_share_switch_rechecks_hide_panel_even_in_the_same_window(self):
+        self.app.meeting_window_id='4096'
+        self.app._share_signature="phone's screen"
+        self.app._share_panel_hidden=True
+        self.app._last_view_attempt=123
+        async def command(*args,**kwargs):
+            return b'4096' if args[:2]==('xdotool','search') else b'Zoom Meeting'
+        self.app.command=AsyncMock(side_effect=command)
+        async def read(**kwargs):
+            self.app.lines=[("Computer's screen",550,36),('Participants Share Leave',900,1175)]
+        self.app.read_screen=AsyncMock(side_effect=read)
+        self.assertEqual(await self.app.snapshot(),'admitted')
+        self.assertFalse(self.app._share_panel_hidden)
+        self.assertEqual(self.app._last_view_attempt,float('-inf'))
+
+    async def test_normal_app_exit_after_admission_is_terminal_but_crash_can_recover(self):
+        self.app.process=SimpleNamespace(returncode=0)
+        self.assertEqual(await self.app.snapshot(),'ended')
+        self.app.process.returncode=-9
+        self.assertEqual(await self.app.snapshot(),'disconnected')
+
+    async def test_owned_end_popup_with_generic_title_gets_a_terminal_reference(self):
+        self.app.meeting_window_id='4096'
+        self.app._last_screen_png=b'private-terminal-image'
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','search'):
+                return b'4096\n4097'
+            if args[:2]==('xdotool','getwindowname'):
+                return b'Zoom Workplace'
+            if args[:2]==('xdotool','getwindowgeometry'):
+                return b'X=674\nY=380\nWIDTH=572\nHEIGHT=422'
+            return b''
+        self.app.command=AsyncMock(side_effect=command)
+        async def read(**kwargs):
+            self.app.lines=[('This meeting has been ended by the host',957,564)]
+        self.app.read_screen=AsyncMock(side_effect=read)
+        with patch('zoom_desktop.transient_parent',return_value='4096'):
+            self.assertEqual(await self.app.snapshot(),'ended')
+        self.assertEqual(self.app.terminal_reference,(b'private-terminal-image',(674,380,1246,802)))
+
+    async def test_notification_is_not_used_as_an_end_dialog_reference(self):
+        self.app.meeting_window_id='4096'
+        self.app._last_screen_png=b'private-terminal-image'
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','search'):
+                return b'4096\n4097\n4098'
+            if args[:2]==('xdotool','getwindowname'):
+                return b'Zoom Workplace'
+            if args[:2]==('xdotool','getwindowgeometry'):
+                return b'X=674\nY=380\nWIDTH=572\nHEIGHT=422' if args[-1]=='4097' else b'X=1400\nY=30\nWIDTH=450\nHEIGHT=100'
+            return b''
+        self.app.command=AsyncMock(side_effect=command)
+        async def read(**kwargs):
+            self.app.lines=[('This meeting has been ended by the host',957,564),('Take notes',1600,70)]
+        self.app.read_screen=AsyncMock(side_effect=read)
+        with patch('zoom_desktop.transient_parent',return_value='4096'):
+            self.assertEqual(await self.app.snapshot(),'ended')
+        self.assertEqual(self.app.terminal_reference[1],(674,380,1246,802))
+
 
 class AudioButtonGeometryTests(unittest.TestCase):
     def test_filled_join_button_is_separated_from_test_link_and_checkbox(self):
@@ -217,6 +277,26 @@ class AudioButtonGeometryTests(unittest.TestCase):
 
 
 class DesktopFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_reference_is_private_and_deleted_after_worker(self):
+        rec=ZoomRecorder()
+        with tempfile.TemporaryDirectory() as folder:
+            rec.output_path=Path(folder)/'original.mp4'
+            rec._native_terminal_reference=(b'private-end-screen',(10,20,200,100))
+            process=SimpleNamespace(pid=12345,returncode=0,
+                communicate=AsyncMock(return_value=(b'end-trimmed',b'')))
+            references=[]
+            async def launch(*args,**kwargs):
+                index=args.index('--terminal-reference')
+                reference=Path(args[index+1])
+                references.append(reference)
+                self.assertEqual(reference.stat().st_mode&0o777,0o600)
+                self.assertEqual(reference.read_bytes(),b'private-end-screen')
+                return process
+            with patch('recorder.asyncio.create_subprocess_exec',new=AsyncMock(side_effect=launch)):
+                await rec._clean_native_video()
+            self.assertTrue(references)
+            self.assertFalse(references[0].exists())
+
     async def test_native_cleanup_timeout_stops_worker_group_and_keeps_original(self):
         rec=ZoomRecorder()
         with tempfile.TemporaryDirectory() as folder:
