@@ -79,7 +79,7 @@ class NativeDesktopLink(BrowserLoginLink):
         return web.Response(text=html, content_type='text/html')
 
     async def status(self, request):
-        return web.json_response({'phase': 'manual', 'message': 'Haqiqiy Zoom Desktop. Login yoki kirishni oynada yakunlang; yozuv kirish aniqlangach boshlanadi.'})
+        return web.json_response({'phase': 'manual', 'message': 'Zoom Desktop maydonini bosing, so‘ng matn kiriting yoki o‘chiring. Akkauntga kirgach login Zoom tomonidan shu serverda saqlanadi; “Keep me signed in” bo‘lsa belgilang.'})
 
     async def save(self, request):
         return web.json_response({'ok': False, 'message': 'Desktop logini ilovaning o‘zida saqlanadi. MongoDB brauzer sessiyasini saqlaydi.'}, status=409)
@@ -91,22 +91,46 @@ class NativeDesktopLink(BrowserLoginLink):
         return web.json_response({'ok': True})
 
     async def type_text(self, request):
-        data = await request.json()
-        text = str(data.get('text', ''))
-        if len(text) > 4096:
-            raise web.HTTPBadRequest()
+        try:
+            data = await request.json()
+            text = data.get('text', '')
+            if not isinstance(text, str) or not text or len(text) > 4096:
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError):
+            return web.json_response({'ok': False, 'message': 'Kiritish uchun matn yozing (4096 belgigacha).'}, status=400)
         async with self.lock:
-            if data.get('replace', True):
-                await self.browser.command('xdotool', 'key', '--clearmodifiers', 'ctrl+a')
-            # stdin avoids putting passwords/OTP in the process command line.
-            await self.browser.command('xdotool', 'type', '--clearmodifiers', '--file', '-', input=text.encode())
-            if data.get('enter'):
-                await self.browser.command('xdotool', 'key', 'Return')
+            try:
+                if data.get('replace', True):
+                    await self.browser.command('xdotool', 'key', '--clearmodifiers', 'ctrl+a', check=True)
+                # stdin avoids putting passwords/OTP in the process command line.
+                await self.browser.command('xdotool', 'type', '--clearmodifiers', '--file', '-', input=text.encode(), check=True)
+                if data.get('enter'):
+                    await self.browser.command('xdotool', 'key', 'Return', check=True)
+            except (OSError, RuntimeError, asyncio.TimeoutError):
+                return web.json_response({'ok': False, 'message': 'Matn kiritilmadi. Zoom maydonini qayta bosing.'}, status=503)
         return web.json_response({'ok': True, 'message': 'Matn faol maydonga kiritildi.'})
 
     async def enter(self, request):
-        await self.browser.command('xdotool', 'key', 'Return')
+        async with self.lock:
+            try:
+                await self.browser.command('xdotool', 'key', '--clearmodifiers', 'Return', check=True)
+            except (OSError, RuntimeError, asyncio.TimeoutError):
+                return web.json_response({'ok': False, 'message': 'Enter bajarilmadi. Zoom oynasini qayta bosing.'}, status=503)
         return web.json_response({'ok': True})
+
+    async def edit(self, request):
+        try:
+            action = (await request.json()).get('action')
+            keys = {'backspace': ('BackSpace',), 'select_all': ('ctrl+a',),
+                    'clear': ('ctrl+a', 'BackSpace')}[action]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return web.json_response({'ok': False, 'message': 'Noma’lum tahrirlash amali.'}, status=400)
+        async with self.lock:
+            try:
+                await self.browser.command('xdotool', 'key', '--clearmodifiers', *keys, check=True)
+            except (OSError, RuntimeError, asyncio.TimeoutError):
+                return web.json_response({'ok': False, 'message': 'Tahrirlash bajarilmadi. Zoom maydonini qayta bosing.'}, status=503)
+        return web.json_response({'ok': True, 'message': 'Tanlangan Zoom maydoni tahrirlandi.'})
 
 
 class NativeZoom:
@@ -132,12 +156,14 @@ class NativeZoom:
                     'OMP_THREAD_LIMIT': '2', 'OMP_NUM_THREADS': '2',
                     'XDG_DATA_DIRS': str(ROOT / '.runtime/root/usr/share') + ':' + os.getenv('XDG_DATA_DIRS', '/usr/local/share:/usr/share')}
 
-    async def command(self, *args, input=None, timeout=8):
+    async def command(self, *args, input=None, timeout=8, check=False):
         proc = await asyncio.create_subprocess_exec(*args, env=self.env,
                 stdin=asyncio.subprocess.PIPE if input is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(input), timeout)
+            if check and proc.returncode != 0:
+                raise RuntimeError('Native desktop action failed')
             return out if proc.returncode == 0 else b''
         finally:
             if proc.returncode is None:

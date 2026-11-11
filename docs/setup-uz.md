@@ -74,8 +74,15 @@ Native ilovaning sovuq ishga tushishi server yukiga qarab 30 soniyadan oshishi
 mumkin; brauzer uchun belgilangan 25 soniyalik urinish chegarasi unga tatbiq
 qilinmaydi.
 
-Desktop logini brauzer cookie’laridan alohida; u Zoom’ning mahalliy profilida
-qoladi. MongoDB sinxronlash hozir brauzer sessiyasiga tegishli. Login yoki
+Desktop logini brauzer cookie’laridan alohida. Akkauntga muvaffaqiyatli
+kirgach, Zoom o‘zining mahalliy profilida (`~/.zoom/data`, sozlamalari
+`~/.config/zoomus.conf`) autentifikatsiya holatini saqlaydi. Login oynasida
+**Keep me signed in** varianti bo‘lsa uni belgilang. Bot bu kataloglarni har
+bir yozuvdan keyin o‘chirmaydi va akkauntdan Sign out qilmaydi. Sessiya Zoom
+tomonidan bekor qilinsa yoki muddati tugasa qayta login kerak bo‘lishi mumkin.
+Boshqa serverga Desktop loginini ko‘chirish yoki MongoDB orqali sinxronlash
+hozir amalga oshirilmagan; MongoDB’dagi browser cookie’lari Native login
+hisoblanmaydi. MongoDB sinxronlash hozir brauzer sessiyasiga tegishli. Login yoki
 qo‘shimcha ruxsat kerak bo‘lsa faqat `OWNER_TELEGRAM_ID` egasiga 15 daqiqalik
 boshqaruv havolasi yuboriladi. Desktop bir server foydalanuvchisida bir vaqtda
 bitta yozuvga xizmat qiladi; boshqa ochiq Zoom nusxasiga ulanmaydi.
@@ -219,6 +226,14 @@ noVNC/VNC faqat localhost’da ishlaydi; Cloudflare Quick Tunnel vaqtinchalik
 HTTPS ulanish beradi. Saqlashdan yoki bekor qilishdan keyin link o‘chadi.
 Maydonga matnni joylash tugmasi bor; uning oldidan Zoom’dagi kerakli maydonni
 bosing. Sessiya ma’lumotlari HTTP loglarga yozilmaydi.
+
+Brauzer va Desktop boshqaruv sahifasida **⌫ Bitta belgi**, **Hammasini
+tanlash**, **Zoom maydonini tozalash** bor. Avval masofadagi Zoom oynasida
+kerakli email/parol/kod maydonini bosing, keyin tegishli tugmani bosing.
+**Oldingi matnni almashtirish** yoqilgan bo‘lsa kiritilgan matn butun maydonni
+almashtiradi; o‘chirilgan bo‘lsa mavjud matnga qo‘shiladi. Tozalash faqat
+joriy tanlangan matn maydoniga qaratilgan, akkaunt sessiyasini o‘chirmaydi.
+Yangi boshqaruvlar uchun yangilangan botdan yangi havola oching.
 
 Kiritish maydoni odatda matnni ko‘rsatadi; **Matnni yashirish** bilan berkitish
 mumkin. **Kiritish + Enter** matnni tanlangan Zoom maydoniga bir yo‘la joylab,

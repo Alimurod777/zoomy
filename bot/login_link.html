@@ -31,6 +31,10 @@ button.primary{background:#2267dc;border-color:#3983ff}button:disabled{opacity:.
  <button id="type" type="button">Kiritish</button>
  <button id="advance" type="submit" class="primary">Kiritish + Enter ↵</button>
  <button id="enter" type="button" title="Zoom oynasida Enter bosish">Enter ↵</button>
+ <button id="backspace" type="button" title="Avval Zoom maydonini bosing; kursordan oldingi belgini o‘chiradi">⌫ Bitta belgi</button>
+ <button id="select-all" type="button" title="Tanlangan Zoom maydonidagi barcha matnni tanlash">Hammasini tanlash</button>
+ <button id="clear" type="button" title="Avval Zoom maydonini bosing; shu maydonni to‘liq tozalaydi">Zoom maydonini tozalash</button>
+ <label><input id="replace" type="checkbox" checked> Oldingi matnni almashtirish</label>
 </form>
 <div class="hint" role="status" aria-live="polite"><span id="phase">Ulanish</span><span id="status">Brauzerga ulanmoqda…</span></div>
 <main id="desktop" aria-label="Zoom brauzer oynasi"></main>
@@ -81,13 +85,23 @@ $('#full').onclick=async()=>{
 };
 $('#tools').onclick=()=>{const hide=document.body.classList.toggle('hide-entry');$('#tools').textContent=hide?'Kiritishni ko‘rsatish':'Kiritishni yashirish';};
 $('#visibility').onclick=()=>{const hidden=field.type==='text';field.type=hidden?'password':'text';$('#visibility').textContent=hidden?'Matnni ko‘rsatish':'Matnni yashirish';$('#visibility').setAttribute('aria-pressed',String(hidden));};
+function busy(value){for(const id of ['entry','type','advance','enter','backspace','select-all','clear','replace'])$('#'+id).disabled=value;}
 async function insert(enter){
  if(!field.value){message('Avval yuqoridagi maydonga matn yozing.',5000);field.focus();return;}
- $('#type').disabled=$('#advance').disabled=true;
- try{const result=await request('type',{text:field.value,replace:true,enter});if(result.ok)field.value='';}
+ busy(true);
+ try{const result=await request('type',{text:field.value,replace:$('#replace').checked,enter});if(result.ok)field.value='';}
  catch(e){message('Matn yuborilmadi. Ulanishni tekshirib qayta bosing.',5000);}
- finally{$('#type').disabled=$('#advance').disabled=false;}
+ finally{busy(false);}
 }
+async function edit(action){
+ busy(true);
+ try{const result=await request('edit',{action});if(result.ok&&action==='clear')field.value='';}
+ catch(e){message('Tahrirlash bajarilmadi. Ulanishni tekshiring.',5000);}
+ finally{busy(false);}
+}
+$('#backspace').onclick=()=>edit('backspace');
+$('#select-all').onclick=()=>edit('select_all');
+$('#clear').onclick=()=>edit('clear');
 $('#type').onclick=()=>insert(false);
 $('#entry-form').onsubmit=e=>{e.preventDefault();insert(true);};
 $('#enter').onclick=()=>request('enter').catch(()=>message('Ulanishni tekshiring.',5000));

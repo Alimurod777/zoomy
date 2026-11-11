@@ -65,6 +65,7 @@ class BrowserLoginLink:
         app.router.add_get('/s/{token}/status', self.status)
         app.router.add_post('/s/{token}/type', self.type_text)
         app.router.add_post('/s/{token}/enter', self.enter)
+        app.router.add_post('/s/{token}/edit', self.edit)
         app.router.add_post('/s/{token}/viewport', self.viewport)
         return app
 
@@ -145,6 +146,30 @@ class BrowserLoginLink:
                 return web.json_response({"ok": True, "message": "Enter bosildi. Zoom javobini kuting."})
             except Exception:
                 return web.json_response({"ok": False, "message": "Zoom oynasini bosing va qayta urinib ko‘ring."}, status=503)
+
+    async def edit(self, request):
+        try:
+            action = (await request.json()).get('action')
+            keys = {'backspace': ('Backspace',), 'select_all': ('ControlOrMeta+A',),
+                    'clear': ('ControlOrMeta+A', 'Backspace')}[action]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return web.json_response({'ok': False, 'message': 'Noma’lum tahrirlash amali.'}, status=400)
+        async with self.lock:
+            try:
+                page = await self.target_page()
+                editable = await page.evaluate('''() => {
+                    const e=document.activeElement;
+                    return !!e&&!e.disabled&&!e.readOnly&&(
+                        (e.tagName==='INPUT'&&!['checkbox','radio','button','submit'].includes(e.type))
+                        ||e.tagName==='TEXTAREA'||e.isContentEditable);
+                }''')
+                if not editable:
+                    return web.json_response({'ok': False, 'message': 'Avval Zoom oynasidagi kerakli matn maydonini bosing.'}, status=409)
+                for key in keys:
+                    await page.keyboard.press(key)
+            except Exception:
+                return web.json_response({'ok': False, 'message': 'Tahrirlash bajarilmadi. Zoom maydonini qayta bosing.'}, status=503)
+        return web.json_response({'ok': True, 'message': 'Tanlangan Zoom maydoni tahrirlandi.'})
 
     async def viewport(self, request):
         """Resize the login browser and capture area, keeping the same session."""

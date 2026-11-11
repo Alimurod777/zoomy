@@ -92,8 +92,17 @@ prevent fallback or `desktop` to force the native client when a browser cannot
 identify the restriction. Native support is experimental: admission is checked
 from visible meeting controls, and an open app alone does not start recording.
 
-Desktop login is separate from MongoDB browser cookies and stays in Zoom's local
-profile. Only `OWNER_TELEGRAM_ID` receives a temporary control link for login or
+Desktop login is separate from MongoDB browser cookies. After successful
+account sign-in, Zoom maintains its local profile (`~/.zoom/data` and
+`~/.config/zoomus.conf`); enable Keep me signed in if offered. The recorder
+does not delete that profile or sign the account out. Native session migration
+and MongoDB synchronization are not implemented. The temporary login/control page includes Backspace, Select all, and Clear
+selected Zoom field buttons. Focus the remote input first. The Replace previous
+text checkbox switches between replacement and appending. Browser edits verify
+that an editable field has focus; native edits send fixed keyboard actions to
+the focused desktop field. The token, expiry, and origin checks apply to editing.
+
+Only `OWNER_TELEGRAM_ID` receives a temporary control link for login or
 additional prompts. Native Zoom supports one recording per server user; it uses
 a silent virtual microphone and the session's dedicated audio sink. Native
 recordings preserve the whole frame. The local Zoom preferences use Hide for
@@ -570,7 +579,7 @@ git fetch origin && git reset --hard origin/main
 - Each recording's `.metadata.json` includes the Telegram `user_id` that started it
 - Displayed duration is measured from the moment FFmpeg starts (not browser join) and excludes paused time, so it stays consistent with the file size across `/peek` and the hourly notice
 - The hourly "still running" notice and the silence warning both include a live screenshot, like `/peek`
-- FFmpeg encodes at CRF 26, `veryfast` preset, 24fps — balanced quality/size for meeting content
+- FFmpeg encodes at CRF 26, `veryfast` preset, 15fps by default (`RECORD_FPS` configurable) — balanced quality/size for meeting content
 - Recordings are written as fragmented MP4, so a killed FFmpeg (crash, OOM, forced stop) still leaves a playable file up to the last few seconds instead of an unreadable one with no index
 - On `docker stop` / `docker compose up -d --build` the bot stops live recordings and finalizes them first (`stop_grace_period: 90s` in `docker-compose.yml`, `SHUTDOWN_GRACE_SECS` default 75). Those recordings are saved but not auto-transcribed or uploaded to YouTube; transcribe from `/history`. Still avoid rebuilding mid-meeting — the recording ends at that point
 - On `/stop` the bot stops encoding, then clicks Zoom's **Leave → Leave Meeting** before closing the browser, so its name leaves the participant list right away instead of lingering until Zoom times the dropped connection out. Only the exact "Leave Meeting" button is clicked (never "End Meeting for All"). If Zoom's markup changes and the button isn't found, it logs `Could not leave via the Leave button` and falls back to closing the browser
