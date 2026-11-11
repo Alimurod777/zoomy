@@ -1,5 +1,6 @@
 """Rootless native Zoom fallback. Never treats an open app as admission."""
 import asyncio
+from collections import deque
 import csv
 import fcntl
 import io
@@ -67,6 +68,42 @@ def native_state(lines, meeting_window=False, previously_admitted=False):
     # Home offers both Join and Sign in; that is not an authentication demand.
     # Explicit meeting authentication requirements are handled by the classifier.
     return 'connecting'
+
+
+def blue_audio_buttons(image):
+    """Candidate filled buttons, only inside a positively identified dialog."""
+    from PIL import ImageChops
+    r,g,b=image.convert('RGB').split()
+    mask=ImageChops.multiply(r.point(lambda v:255 if v<120 else 0),
+                            b.point(lambda v:255 if v>160 else 0))
+    mask=ImageChops.multiply(mask,g.point(lambda v:255 if 45<v<195 else 0))
+    width,height=image.size
+    pixels=bytearray(mask.tobytes())
+    boxes=[]
+    for start in range(len(pixels)):
+        if not pixels[start]:
+            continue
+        pixels[start]=0
+        todo=deque([start])
+        left=right=start%width
+        top=bottom=start//width
+        count=0
+        while todo:
+            index=todo.popleft()
+            x,y=index%width,index//width
+            left,right=min(left,x),max(right,x)
+            top,bottom=min(top,y),max(bottom,y)
+            count+=1
+            for neighbor in (index-width if y else -1,index+width if y<height-1 else -1,
+                             index-1 if x else -1,index+1 if x<width-1 else -1):
+                if neighbor>=0 and pixels[neighbor]:
+                    pixels[neighbor]=0
+                    todo.append(neighbor)
+        w,h=right-left+1,bottom-top+1
+        if (100<=w<=width*.8 and 18<=h<=70 and count/(w*h)>.55
+                and abs((left+right)/2-width/2)<width*.2 and height*.2<top<height*.75):
+            boxes.append((left,top,right+1,bottom+1))
+    return boxes
 
 
 class NativeDesktopLink(BrowserLoginLink):
@@ -160,6 +197,10 @@ class NativeZoom:
         self._last_view_attempt = float('-inf')
         self.auth_store = DesktopAuthStore()
         self.profile_sync = 'disabled'
+        self.share_seen = False
+        self.audio_dialog_open = False
+        self.audio_window_rect = None
+        self._last_header_ocr = float('-inf')
         self.env = {**os.environ, 'DISPLAY': display, 'PULSE_SINK': sink,
                     'LIBGL_ALWAYS_SOFTWARE': '1', 'QT_QPA_PLATFORM': 'xcb',
                     'OMP_THREAD_LIMIT': '2', 'OMP_NUM_THREADS': '2',
@@ -232,48 +273,149 @@ class NativeZoom:
         if self.process and self.process.returncode is not None:
             return 'disconnected'
         window_ids = (await self.command('xdotool', 'search', '--onlyvisible', '--class', 'zoom')).decode().split()
-        meeting_window = False
+        meeting_window = self.meeting_window_id is not None and self.meeting_window_id in window_ids
+        main_candidates = []
+        audio_dialog = False
+        self.audio_window_rect = None
+        popup_regions = []
         for wid in window_ids[:20]:
             title = (await self.command('xdotool', 'getwindowname', wid)).decode(errors='replace').strip()
+            is_audio = bool(re.search(r'(?:audio conference options|join audio)', title, re.I))
+            if is_audio or title.casefold() == 'zoom':
+                audio_dialog = audio_dialog or is_audio
+                geometry=(await self.command('xdotool','getwindowgeometry','--shell',wid)).decode()
+                values=dict(re.findall(r'^(X|Y|WIDTH|HEIGHT)=(-?\d+)$',geometry,re.M))
+                if len(values)==4:
+                    x,y,w,h=(int(values[k]) for k in ('X','Y','WIDTH','HEIGHT'))
+                    if 0<=x<x+w<=1920 and 0<=y<y+h<=1200:
+                        popup_regions.append((x,y,x+w,y+h))
+                        if is_audio:
+                            self.audio_window_rect=(x,y,x+w,y+h)
+            if title.casefold() == 'zoom workplace':
+                main_candidates.append(wid)
             if re.fullmatch(r'Zoom (Meeting|Webinar)(?:\s.*)?', title, re.I):
                 meeting_window = True
                 if self.meeting_window_id != wid:
                     self._share_panel_hidden = False
                 self.meeting_window_id = wid
-        await self.read_screen(margins_only=self.admitted and meeting_window)
+        # The computer-audio dialog is centered, outside the status margins.
+        await self.read_screen(margins_only=self.admitted and meeting_window, extra_regions=popup_regions)
+        self.share_seen = self.share_seen or any(
+            y < 150 and re.search(r"(?:['’]s\s+screen|view options|you are viewing)", label, re.I)
+            for label, _, y in self.lines)
+        self.audio_dialog_open = audio_dialog
+        state_lines = list(self.lines)
+        if audio_dialog:
+            await self.join_computer_audio(refresh=False)
         if any('zoom quit unexpectedly' in line[0].lower() for line in self.lines):
             await self.click_label("Don't send") or await self.click_label('Don’t send')
             return 'connecting'
-        state = native_state(self.lines, meeting_window, self.admitted)
+        state = native_state(state_lines, meeting_window, self.admitted)
         if state == 'admitted':
             self.admitted = True
+            # Recent Linux clients title the meeting "Zoom Workplace" too.
+            # Choose the largest owned window only after actual admission.
+            if not self.meeting_window_id and main_candidates:
+                sizes = []
+                for wid in main_candidates:
+                    geometry = (await self.command('xdotool', 'getwindowgeometry', '--shell', wid)).decode()
+                    width = re.search(r'^WIDTH=(\d+)$', geometry, re.M)
+                    height = re.search(r'^HEIGHT=(\d+)$', geometry, re.M)
+                    if width and height:
+                        sizes.append((int(width[1])*int(height[1]),wid))
+                if sizes:
+                    self.meeting_window_id = max(sizes)[1]
         return state
 
-    async def read_screen(self, margins_only=False):
+    async def read_screen(self, margins_only=False, extra_regions=()):
         # Read controls/status, never infer host removal from meeting chat text.
         image = await self.command('ffmpeg', '-loglevel', 'error', '-f', 'x11grab', '-draw_mouse', '0',
                 '-s', '1920x1200', '-i', self.display, '-frames:v', '1', '-threads', '1', '-f', 'image2pipe', '-vcodec', 'png', '-')
         if not image:
             self.lines = []
             return
+        from PIL import Image, ImageOps
+        source = Image.open(io.BytesIO(image))
         # Once admitted, OCR only toolbar/status margins while a meeting window
         # remains. Main content may itself contain words like "meeting ended".
         if margins_only:
-            from PIL import Image
-            source = Image.open(io.BytesIO(image))
             canvas = Image.new('RGB', (1920, 1200), 'white')
             canvas.paste(source.crop((0, 0, 1920, 100)), (0, 0))
             canvas.paste(source.crop((0, 1040, 1920, 1200)), (0, 1040))
+            for rect in extra_regions:
+                canvas.paste(source.crop(rect), rect[:2])
             out = io.BytesIO()
             canvas.save(out, format='PNG')
             image = out.getvalue()
         tsv = await self.command('tesseract', 'stdin', 'stdout', '-l', 'eng', '--psm', '11', 'tsv', input=image, timeout=12)
         self.lines = ocr_lines(tsv.decode(errors='replace'))
+        async def enhanced(region,rect,scale,psm='11',button=False):
+            if button:
+                region=ImageOps.invert(region.convert('L').point(lambda v:255 if v>200 else 0))
+            region=region.resize((region.width*scale,region.height*scale))
+            buffer=io.BytesIO()
+            region.save(buffer,format='PNG')
+            result=await self.command('tesseract','stdin','stdout','-l','eng','--psm',psm,'tsv',
+                                      input=buffer.getvalue(),timeout=12)
+            self.lines.extend((label,rect[0]+x//scale,rect[1]+y//scale)
+                              for label,x,y in ocr_lines(result.decode(errors='replace')))
+        if not self.share_seen and time.monotonic()-self._last_header_ocr>5:
+            self._last_header_ocr=time.monotonic()
+            await enhanced(source.crop((0,0,1920,100)),(0,0,1920,100),3)
+        if self.audio_window_rect:
+            rect=self.audio_window_rect
+            region=source.crop(rect)
+            await enhanced(region,rect,2)
+            for box in blue_audio_buttons(region):
+                absolute=(rect[0]+box[0],rect[1]+box[1],rect[0]+box[2],rect[1]+box[3])
+                await enhanced(region.crop(box),absolute,3,psm='7',button=True)
 
     async def park_pointer(self):
         # The bottom/right edges reveal Zoom's auto-hidden controls. The
         # pointer itself is excluded by FFmpeg; leave it on the content edge.
         await self.command('xdotool', 'mousemove', '4', '600')
+
+    async def join_computer_audio(self, refresh=True):
+        """Positive Join actions only; never open the speaker/mic test wizard."""
+        if refresh:
+            await self.read_screen()
+        footer = next(((x,y) for label,x,y in self.lines
+                       if label.strip().casefold() == 'join audio' and y > 1120), None)
+        if footer:
+            await self.command('xdotool', 'mousemove', str(footer[0]), str(footer[1]), 'click', '1')
+            await asyncio.sleep(0.3)
+            await self.read_screen()
+        join = next(((x, y) for label, x, y in self.lines
+                     if re.fullmatch(r'(?:join\s+)?with computer audio|join with computer audio',
+                                     label.strip(), re.I)), None)
+        if join:
+            x, y = join
+            await self.command('xdotool', 'mousemove', str(x), str(y), 'click', '1')
+            await self.park_pointer()
+            self.audio_window_rect = None
+            # Refresh before any Mute action: the footer may just have changed.
+            await asyncio.sleep(0.3)
+            await self.read_screen()
+            self.audio_dialog_open = any('test speaker and microphone' in label.lower()
+                     or re.fullmatch(r'(?:join\s+)?with computer audio|join with computer audio',label.strip(),re.I)
+                     for label, _, _ in self.lines)
+            return not self.audio_dialog_open
+        self.audio_dialog_open = any('test speaker and microphone' in label.lower()
+                     or label.strip().casefold() == 'join audio' and y > 1120
+                     for label, _, y in self.lines)
+        return not self.audio_dialog_open
+
+    async def close_auxiliary_windows(self):
+        """Close only named auxiliary Zoom windows, never the meeting itself."""
+        if not shutil.which('wmctrl'):
+            return
+        ids = (await self.command('xdotool', 'search', '--onlyvisible', '--class', 'zoom')).decode().split()
+        for wid in ids[:20]:
+            if wid == self.meeting_window_id:
+                continue
+            title = (await self.command('xdotool', 'getwindowname', wid)).decode(errors='replace').strip()
+            if re.fullmatch(r'(?:Participants|Meeting Chat|In-Meeting Chat|Notes)', title, re.I):
+                await self.command('wmctrl', '-i', '-c', hex(int(wid)))
 
     async def click_label(self, text):
         for label, x, y in self.lines:
@@ -328,11 +470,20 @@ class NativeZoom:
             self._fullscreen_window_id = wid
 
     async def prepare(self):
+        # Snapshot may have read only the footer; refresh the central dialog.
+        for _ in range(3):
+            if await self.join_computer_audio():
+                break
+            if self.stop_event.is_set():
+                return
+        if self.audio_dialog_open:
+            raise RuntimeError('Zoom kompyuter audiosiga ulanmagan; audio oynasi ustidan yozuv boshlanmadi.')
         # Exact labels only: never toggle Unmute / Start Video / Share Screen.
-        for label in ('Join with Computer Audio', 'Join Audio', 'Mute', 'Stop Video'):
+        for label in ('Mute', 'Stop Video'):
             await self.click_label(label)
         try:
             await self.ensure_fullscreen()
+            await self.close_auxiliary_windows()
             await self.clean_shared_view()
         except Exception:
             logger.warning('Could not apply native view preferences; preserving the full frame')

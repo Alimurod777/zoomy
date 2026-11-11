@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import signal
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -10,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bot'))
 from zoom_desktop import native_join_uri, native_state, ocr_lines, NativeDesktopLink, NativeZoom
+from zoom_desktop import blue_audio_buttons
 from recorder import ZoomRecorder, DesktopRequired
 import recorder as recorder_module
 
@@ -131,8 +133,110 @@ class NativeViewTests(unittest.IsolatedAsyncioTestCase):
         await self.app.clean_shared_view()
         self.app.read_screen.assert_awaited_once()
 
+    async def test_central_computer_audio_dialog_is_joined_without_opening_test_wizard(self):
+        screens = [[('Join with Computer Audio',960,564),('Test speaker and microphone',960,597)],
+                   [('Mute',50,1150),('Participants',850,1180)]]
+        async def read(**kwargs):
+            self.app.lines=screens.pop(0)
+        self.app.read_screen=AsyncMock(side_effect=read)
+        with patch('zoom_desktop.asyncio.sleep',new=AsyncMock()):
+            self.assertTrue(await self.app.join_computer_audio())
+        self.app.command.assert_any_await('xdotool','mousemove','960','564','click','1')
+        self.assertFalse(any('597' in call.args for call in self.app.command.await_args_list))
+        self.assertFalse(self.app.audio_dialog_open)
+
+    async def test_recording_is_blocked_if_audio_dialog_does_not_disappear(self):
+        self.app.read_screen=AsyncMock()
+        self.app.lines=[('Join with Computer Audio',960,564),('Test speaker and microphone',960,597)]
+        with patch('zoom_desktop.asyncio.sleep',new=AsyncMock()):
+            with self.assertRaisesRegex(RuntimeError,'audiosiga'):
+                await self.app.prepare()
+
+    async def test_close_only_named_auxiliary_window_never_meeting(self):
+        self.app.meeting_window_id='4096'
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','search'):
+                return b'4096\n4097\n4098\n'
+            if args[:2]==('xdotool','getwindowname'):
+                return {'4097':b'Meeting Chat','4098':b'Zoom Workplace'}[args[2]]
+            return b''
+        self.app.command=AsyncMock(side_effect=command)
+        with patch('zoom_desktop.shutil.which',return_value='/runtime/wmctrl'):
+            await self.app.close_auxiliary_windows()
+        self.app.command.assert_any_await('wmctrl','-i','-c','0x1001')
+        self.assertEqual(sum(call.args[:1]==('wmctrl',) for call in self.app.command.await_args_list),1)
+
+    async def test_modern_zoom_workplace_meeting_gets_the_largest_owned_window(self):
+        self.app.meeting_window_id=None
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','search'):
+                return b'4096\n4097'
+            if args[:2]==('xdotool','getwindowname'):
+                return b'Zoom Workplace'
+            if args[:2]==('xdotool','getwindowgeometry'):
+                return b'WIDTH=1920\nHEIGHT=1200' if args[-1]=='4097' else b'WIDTH=1230\nHEIGHT=723'
+            return b''
+        self.app.command=AsyncMock(side_effect=command)
+        async def read(**kwargs):
+            self.app.lines=[('Participants Share Leave',900,1175),("Phone's screen",520,36)]
+        self.app.read_screen=AsyncMock(side_effect=read)
+        self.assertEqual(await self.app.snapshot(),'admitted')
+        self.assertEqual(self.app.meeting_window_id,'4097')
+        self.assertTrue(self.app.share_seen)
+
+    async def test_audio_popup_is_read_alongside_margins_without_reading_shared_slide(self):
+        self.app.meeting_window_id='4096'
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','search'):
+                return b'4096\n4097'
+            if args[:2]==('xdotool','getwindowname'):
+                return b'Zoom Workplace' if args[-1]=='4096' else b'Choose one of the audio conference options'
+            if args[:2]==('xdotool','getwindowgeometry'):
+                return b'X=674\nY=380\nWIDTH=572\nHEIGHT=422'
+            return b''
+        self.app.command=AsyncMock(side_effect=command)
+        async def read(**kwargs):
+            self.app.lines=[('Participants Share Leave',900,1175),('Join with Computer Audio',957,564)]
+        self.app.read_screen=AsyncMock(side_effect=read)
+        self.app.join_computer_audio=AsyncMock(return_value=True)
+        self.assertEqual(await self.app.snapshot(),'admitted')
+        self.app.read_screen.assert_awaited_once_with(margins_only=True,extra_regions=[(674,380,1246,802)])
+        self.app.join_computer_audio.assert_awaited_once_with(refresh=False)
+
+
+class AudioButtonGeometryTests(unittest.TestCase):
+    def test_filled_join_button_is_separated_from_test_link_and_checkbox(self):
+        from PIL import Image, ImageDraw
+        image=Image.new('RGB',(572,422),'white')
+        draw=ImageDraw.Draw(image)
+        draw.rectangle((170,169,401,198),fill=(0,112,243))
+        draw.rectangle((30,380,45,395),fill=(0,112,243))
+        for x in range(200,370,15):
+            draw.rectangle((x,213,x+5,220),fill=(0,112,243))
+        self.assertEqual(blue_audio_buttons(image),[(170,169,402,199)])
+
 
 class DesktopFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_cleanup_timeout_stops_worker_group_and_keeps_original(self):
+        rec=ZoomRecorder()
+        with tempfile.TemporaryDirectory() as folder:
+            rec.output_path=Path(folder)/'original.mp4'
+            rec.output_path.write_bytes(b'original-recording')
+            process=SimpleNamespace(pid=12345,returncode=None,
+                communicate=AsyncMock(side_effect=asyncio.TimeoutError()),wait=AsyncMock())
+            with patch('recorder.asyncio.create_subprocess_exec',new=AsyncMock(return_value=process)), \
+                    patch('recorder.os.killpg') as kill:
+                await rec._clean_native_video()
+            kill.assert_called_once_with(12345,signal.SIGKILL)
+            process.wait.assert_awaited_once()
+            self.assertEqual(rec.output_path.read_bytes(),b'original-recording')
+
+    async def test_native_cleanup_launch_failure_keeps_recording_available(self):
+        rec=ZoomRecorder()
+        rec.output_path=Path('/tmp/native-test.mp4')
+        with patch('recorder.asyncio.create_subprocess_exec',new=AsyncMock(side_effect=OSError('offline'))):
+            await rec._clean_native_video()
+
     async def test_forced_desktop_bypasses_browser(self):
         rec=ZoomRecorder()
         rec._record_native=AsyncMock()

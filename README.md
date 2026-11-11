@@ -119,7 +119,18 @@ the focused desktop field. The token, expiry, and origin checks apply to editing
 Only `OWNER_TELEGRAM_ID` receives a temporary control link for login or
 additional prompts. Native Zoom supports one recording per server user; it uses
 a silent virtual microphone and the session's dedicated audio sink. Native
-recordings preserve the whole frame. The local Zoom preferences use Hide for
+recordings first preserve the whole frame. With `ZOOM_NATIVE_CLEAN_VIDEO=true`
+(default), detected screen shares are framed after recording, before upload.
+Every frame is analyzed so rotations switch the source region without a stale
+portrait crop. A large central surface separated from Zoom's UI by black margins
+is required; ambiguous frames retain the complete view. Toolbars and separate
+side panels are excluded when the main surface is identified. The output keeps
+its initial surface aspect; a later rotation fits the complete source and can
+add letterboxing. Cleanup runs at low priority with bounded threads and a
+`ZOOM_NATIVE_CLEANUP_TIMEOUT=1800` deadline, so upload may take longer. Uncertain
+detection or processing failure keeps the original recording. Computer-audio
+dialogs are handled before recording and rechecked when they reappear; the
+speaker/microphone test wizard is never selected. The local Zoom preferences use Hide for
 My video, disable Show non-video participants and Keep meeting controls visible,
 and enable full screen and Scale-to-fit for shared content (side-by-side off).
 These preferences were applied in the actual app on this server and persisted

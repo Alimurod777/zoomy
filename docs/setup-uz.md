@@ -103,6 +103,21 @@ boshqaruv havolasi yuboriladi. Desktop bir server foydalanuvchisida bir vaqtda
 bitta yozuvga xizmat qiladi; boshqa ochiq Zoom nusxasiga ulanmaydi.
 
 Desktop’da alohida ovozsiz mikrofon va yozuvning o‘z audio kanali ishlatiladi.
+**Join with Computer Audio** markaziy oynasi yozuvdan oldin tekshiriladi va
+kompyuter audiosiga ulanadi; **Test speaker and microphone** bosilmaydi. Audio
+oynasi yopilmasa uning ustidan yozuv boshlanmaydi. Alohida Participants,
+Meeting Chat va Notes oynalari tayyorlash paytida yopiladi.
+
+`ZOOM_NATIVE_CLEAN_VIDEO=true` (standart) bo‘lsa, ekran ulashilgan Desktop
+yozuvi tugagach, asosiy tasvir maydoni har bir kadrda tekshiriladi. Qora
+chegaralar bilan ajralgan yirik markaziy tasvir aniqlanganda chetdagi panellar,
+yuqori va pastki Zoom boshqaruvlari tashqarida qoladi. Telefon aylansa yangi
+maydon olinadi; eski tik kesim ishlatilmaydi. Yakuniy faylning o‘lchami bir xil
+qoladi: keyin boshqa nisbatga aylansa, butun tasvirni saqlash uchun qora
+bo‘shliq paydo bo‘lishi mumkin. Noaniq kadrlarda to‘liq ko‘rinish saqlanadi;
+ishonch yetmasa yoki qayta ishlash xato bersa asl yozuv qoldiriladi. Jarayon
+past ustuvorlikda, cheklangan CPU oqimlari bilan ishlaydi; upload biroz kechikadi.
+`ZOOM_NATIVE_CLEANUP_TIMEOUT=1800` — qayta ishlash chegarasi (soniya).
 Asosiy tasvir butun kadr bilan saqlanadi. Ushbu serverdagi haqiqiy Zoom
 Settings oynasida quyidagilar sozlandi va ilovani qayta ochganda saqlangani
 tekshirildi (yangi server yoki profil uchun Zoom ichida yana sozlang):
