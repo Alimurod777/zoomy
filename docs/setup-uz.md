@@ -144,8 +144,13 @@ Kichik Silero VAD tekshiruvi nutqni Whisper modelidan oldin qidiradi. Nutq
 bo‘lmasa model yuklanmaydi, til taxmin qilinmaydi va bo‘sh TXT/SRT muvaffaqiyatli
 transkripsiya deb ko‘rsatilmaydi. Video saqlanadi. `AUDIO_WAIT_TIMEOUT` endi
 haqiqiy soniyalik chegara: muddat tugasa video ovoz jim bo‘lsa ham boshlanadi.
-Noma’lum kirish oynasi `ZOOM_CONNECT_TIMEOUT=30` bilan chegaralanadi;
-waiting room va hostni kutish alohida davom etadi.
+Noma’lum kirish oynasining har bir urinishi `ZOOM_CONNECT_TIMEOUT=30` bilan
+chegaralanadi. `ZOOM_JOIN_ATTEMPTS=3` bo‘yicha avtomatik qayta urinadi;
+waiting room va hostni kutish alohida davom etadi. “Host has joined. We’ve let
+them know you’re here” ham waiting room deb taniladi, sahifa yangilanmaydi.
+“Launch Meeting / Open Zoom” tugmalari yoki joriy meeting uchun `zoommtg://`
+protokoliga o‘tish aniqlansa `auto` rejimi haqiqiy Desktop’ni ishga tushiradi.
+Bu brauzerning tashqi ilova dialogini o‘zi yopishini kutishga bog‘liq emas.
 
 Atlas URI tanlanganda lokal MongoDB qayta ishga tushirilmaydi. 2026-11-11:
 keraksiz lokal MongoDB va `Killed`dan qolgan loyiha `:99` Xvfb jarayoni

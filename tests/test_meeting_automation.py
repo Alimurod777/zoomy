@@ -35,6 +35,18 @@ class MeetingStateTests(unittest.TestCase):
         self.assertEqual(classify_meeting('This meeting requires the Zoom app'), 'app_required')
         self.assertNotEqual(classify_meeting('Join this meeting using the Zoom desktop or Join from your browser'), 'app_required')
 
+    def test_host_joined_confirmation_means_waiting_room_not_admission(self):
+        self.assertEqual(classify_meeting("Host has joined. We've let them know you're here."),'waiting_room')
+
+    def test_protocol_handoff_only_accepts_the_current_meeting(self):
+        recorder=ZoomRecorder();recorder.current_url=URL
+        recorder._observe_desktop_handoff({'url':'zoommtg://zoom.us/join?confno=99999999999'})
+        self.assertFalse(recorder._native_handoff_seen)
+        recorder._observe_desktop_handoff({'url':'zoommtg://evil.test/join?confno=97856007427'})
+        self.assertFalse(recorder._native_handoff_seen)
+        recorder._observe_desktop_handoff({'url':'zoommtg://zoom.us/join?confno=97856007427&pwd=secret'})
+        self.assertTrue(recorder._native_handoff_seen)
+
     def test_unstable_network_warning_does_not_force_rejoin(self):
         self.assertEqual(classify_meeting({'text': 'Your internet connection is unstable', 'admitted': True}), 'admitted')
 
@@ -51,6 +63,13 @@ class AdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.clock.now += seconds
             return False
         self.recorder._wait_or_stop = AsyncMock(side_effect=delay)
+
+    async def test_unknown_page_retries_then_enters_running_meeting(self):
+        self.recorder._state=AsyncMock(side_effect=lambda page:'admitted' if self.recorder._open_join_page.await_count>=2 else 'connecting')
+        with patch.object(recorder_module,'time',SimpleNamespace(monotonic=lambda:self.clock.now)), patch.dict(os.environ,ZOOM_CONNECT_TIMEOUT='10',ZOOM_JOIN_ATTEMPTS='3'):
+            self.assertTrue(await self.recorder._join_meeting(self.page,URL))
+        self.assertEqual(self.recorder._open_join_page.await_count,2)
+        self.assertLessEqual(self.clock.now,10)
 
     async def test_host_start_is_retried_and_then_recording_can_join(self):
         self.recorder._state = AsyncMock(side_effect=['waiting_host'] * 4 + ['admitted'])
@@ -141,6 +160,31 @@ class BrowserAdmissionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.browser.close()
         await self.pw.stop()
+
+    async def test_current_waiting_room_copy_is_not_a_missing_join_form(self):
+        async def route(r):
+            await r.fulfill(body="<div class='speaker-active-container__wrap'><video></video></div><p>Host has joined. We've let them know you're here.</p>",content_type='text/html')
+        await self.page.route(URL,route)
+        recorder=ZoomRecorder()
+        await recorder._open_join_page(self.page,URL)
+        self.assertEqual(await recorder._state(self.page),'waiting_room')
+
+    async def test_launch_meeting_landing_switches_to_desktop(self):
+        async def route(r):
+            await r.fulfill(body='<h1>Open Zoom Workplace?</h1><button>Launch Meeting</button>',content_type='text/html')
+        await self.page.route(URL,route)
+        recorder=ZoomRecorder()
+        with patch.dict(os.environ,ZOOM_JOIN_MODE='auto'):
+            with self.assertRaises(recorder_module.DesktopRequired):
+                await recorder._join_meeting(self.page,URL)
+
+    async def test_native_protocol_link_is_not_an_unrecognized_join_page(self):
+        await self.page.set_content('<a href="zoommtg://zoom.us/join?confno=97856007427">Open the application</a>')
+        self.assertEqual(classify_meeting(await self.page.evaluate(SNAPSHOT_JS)),'app_launch')
+
+    async def test_launch_text_inside_chat_does_not_switch_an_admitted_meeting(self):
+        await self.page.set_content('<button class="footer__leave-btn">Leave</button><button>Launch Meeting</button>')
+        self.assertEqual(classify_meeting(await self.page.evaluate(SNAPSHOT_JS)),'admitted')
 
     async def test_join_keeps_prefilled_profile_name_and_does_not_wait_for_url_change(self):
         html = '''<input placeholder="Your Name" value="Profile Name">

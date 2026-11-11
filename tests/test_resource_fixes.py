@@ -98,7 +98,7 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             clock.now+=seconds
             return False
         recorder._wait_or_stop=AsyncMock(side_effect=delay)
-        with patch.object(rec,'time',SimpleNamespace(monotonic=lambda:clock.now)),patch.dict(os.environ,ZOOM_CONNECT_TIMEOUT='30'):
+        with patch.object(rec,'time',SimpleNamespace(monotonic=lambda:clock.now)),patch.dict(os.environ,ZOOM_CONNECT_TIMEOUT='30',ZOOM_JOIN_ATTEMPTS='1'):
             with self.assertRaisesRegex(rec.MeetingJoinError,'30'):
                 await recorder._join_meeting(SimpleNamespace(),'https://zoom.us/wc/12345678900/join')
         self.assertLessEqual(clock.now,30)

@@ -534,6 +534,7 @@ class ZoomRecorder:
         # True when this session loaded a saved Zoom login. Decides which advice
         # the sign-in wall reports: "set one up" vs "yours expired".
         self._signed_in: bool = False
+        self._native_handoff_seen = False
 
     def recording_elapsed_secs(self) -> int:
         """Seconds of *actual* recording, measured from when FFmpeg started.
@@ -644,6 +645,7 @@ class ZoomRecorder:
                     locale="en-US",
                 )
                 page = await ctx.new_page()
+                await self._monitor_desktop_handoff(page)
 
                 if not await self._join_meeting(page, web_url):
                     return
@@ -1374,7 +1376,7 @@ class ZoomRecorder:
                     if not page.is_closed():
                         try:
                             state = await self._state(page)
-                            if state in {"ended", "removed", "auth_required", "app_required", "invalid", "passcode"}:
+                            if state in {"ended", "removed", "auth_required", "app_required", "app_launch", "invalid", "passcode"}:
                                 self._stop_event.set()
                                 if self.on_error:
                                     await self.on_error(self._join_error(state))
@@ -1445,7 +1447,32 @@ class ZoomRecorder:
             return "auth_required"
         if page.url.startswith("chrome-error:"):
             return "disconnected"
-        return classify_meeting(await asyncio.wait_for(page.evaluate(SNAPSHOT_JS), timeout=5))
+        snapshot = await asyncio.wait_for(page.evaluate(SNAPSHOT_JS), timeout=5)
+        if self._native_handoff_seen:
+            snapshot['app_launch'] = True
+        return classify_meeting(snapshot)
+
+    def _observe_desktop_handoff(self, event):
+        url = urlparse(event.get('url', ''))
+        host = (url.hostname or '').lower()
+        if url.scheme not in {'zoommtg', 'zoomus'} or not (host == 'zoom.us' or host.endswith('.zoom.us')):
+            return
+        if url.path.rstrip('/') != '/join' or not self.current_url:
+            return
+        meeting_id, _ = parse_zoom_url(self.current_url)
+        if parse_qs(url.query).get('confno') == [meeting_id]:
+            self._native_handoff_seen = True
+            logger.info('Zoom requested native Desktop handoff')
+
+    async def _monitor_desktop_handoff(self, page):
+        try:
+            session = await page.context.new_cdp_session(page)
+            await session.send('Page.enable')
+            session.on('Page.frameRequestedNavigation', self._observe_desktop_handoff)
+            session.on('Page.windowOpen', self._observe_desktop_handoff)
+        except Exception:
+            # DOM detection still handles ordinary Launch Meeting pages.
+            logger.debug('Native launch protocol monitor unavailable')
 
     async def _wait_or_stop(self, seconds: float) -> bool:
         try:
@@ -1474,6 +1501,7 @@ class ZoomRecorder:
     def _join_error(state: str) -> str:
         return {
             "app_required": "Bu konferensiya haqiqiy Zoom desktop ilovasini talab qiladi. Hozirgi bot Zoom Web App orqali ishlaydi.",
+            "app_launch": "Zoom ilovada ochishni so‘radi. ZOOM_JOIN_MODE=auto yoki desktop bilan qayta urinib ko‘ring.",
             "passcode": "Meeting passcode noto‘g‘ri yoki yetishmayapti. /record ga pwd parametri bor to‘liq taklif havolasini yuboring.",
             "invalid": "Konferensiya havolasi noto‘g‘ri yoki eskirgan.",
             "removed": "Host botni chiqardi yoki kirishni rad etdi. Avtomatik qayta kirish to‘xtatildi.",
@@ -1482,7 +1510,7 @@ class ZoomRecorder:
         }[state]
 
     def _join_exception(self, state):
-        if state == "app_required" and (os.getenv("ZOOM_JOIN_MODE") or "auto").lower() == "auto":
+        if state in {"app_required", "app_launch"} and (os.getenv("ZOOM_JOIN_MODE") or "auto").lower() == "auto":
             return DesktopRequired("Zoom desktop ilovasi talab qilindi")
         return MeetingJoinError(self._join_error(state))
 
@@ -1593,6 +1621,8 @@ class ZoomRecorder:
         attempt_start = time.monotonic()
         connecting_since = time.monotonic()
         connect_timeout = max(10, int(os.getenv("ZOOM_CONNECT_TIMEOUT") or "30"))
+        connect_attempts = max(1, min(5, int(os.getenv('ZOOM_JOIN_ATTEMPTS') or '3')))
+        connect_failures = 0
         while not self._stop_event.is_set() and time.monotonic() < deadline:
             if navigate:
                 attempt_start = time.monotonic()
@@ -1622,7 +1652,7 @@ class ZoomRecorder:
                     if self._stop_event.is_set():
                         return False
                     state = await self._state(page)
-                    if state in {"auth_required", "invalid", "passcode", "app_required", "removed", "ended"}:
+                    if state in {"auth_required", "invalid", "passcode", "app_required", "app_launch", "removed", "ended"}:
                         raise self._join_exception(state) from None
                 navigate = False
             if self._stop_event.is_set():
@@ -1635,12 +1665,23 @@ class ZoomRecorder:
                 await self._join_audio(page)
                 await self._notice_admission(state)
                 return True
-            if state in {"auth_required", "invalid", "passcode", "app_required", "removed", "ended"}:
+            if state in {"auth_required", "invalid", "passcode", "app_required", "app_launch", "removed", "ended"}:
                 raise self._join_exception(state)
             if state in {"waiting_room", "waiting_host"}:
                 connecting_since = time.monotonic()
+                connect_failures = 0
             elif time.monotonic() - connecting_since >= connect_timeout:
-                raise MeetingJoinError(f"Zoom kirish oynasi {connect_timeout} soniyada tayyor bo‘lmadi. /record bilan qayta urinib ko‘ring.")
+                connect_failures += 1
+                if connect_failures >= connect_attempts:
+                    raise MeetingJoinError(f"Zoom kirish oynasi tayyor bo‘lmadi ({connect_attempts} urinish, har biri {connect_timeout} soniya). /record bilan qayta urinib ko‘ring.")
+                if self.on_waiting:
+                    try:
+                        await self.on_waiting(f'Zoomga yana ulanishga harakat qilyapman ({connect_failures+1}/{connect_attempts}). /stop bilan bekor qilish mumkin.')
+                    except Exception:
+                        logger.warning('Could not send connection retry notice')
+                connecting_since = time.monotonic()
+                navigate = True
+                continue
             await self._notice_admission(state)
             elapsed = time.monotonic() - attempt_start
             if state == "waiting_room":
@@ -1695,7 +1736,7 @@ class ZoomRecorder:
         state = await self._state(page)
         if state in {"admitted", "waiting_host", "waiting_room"}:
             return
-        if state in {"app_required", "auth_required", "removed", "invalid"}:
+        if state in {"app_required", "app_launch", "auth_required", "removed", "invalid"}:
             raise self._join_exception(state)
         try:
             link = page.get_by_text("Join from Your Browser", exact=False)
@@ -1839,7 +1880,7 @@ class ZoomRecorder:
             if not waiting_room and await self._wait_or_stop(5):
                 return None
             current = await self._state(page)
-            if current in {"ended", "removed", "auth_required", "app_required", "invalid", "passcode"}:
+            if current in {"ended", "removed", "auth_required", "app_required", "app_launch", "invalid", "passcode"}:
                 raise MeetingJoinError(self._join_error(current))
             if current != "admitted":
                 if not await self._join_meeting(page, web_url, resume_waiting_room=current == "waiting_room"):
@@ -1875,7 +1916,7 @@ class ZoomRecorder:
                     return "encoder_failed"
 
                 state = await self._state(page)
-                if state in {"ended", "removed", "app_required", "auth_required", "invalid", "passcode"}:
+                if state in {"ended", "removed", "app_required", "app_launch", "auth_required", "invalid", "passcode"}:
                     logger.info("Meeting terminal state: %s", state)
                     if state != "ended" and self.on_error:
                         await self.on_error(self._join_error(state))

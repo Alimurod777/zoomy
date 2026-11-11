@@ -137,8 +137,12 @@ two threads and releases model memory on exit. Speech is checked before loading
 a model; silence produces a clear no-speech result. Large models require
 `WHISPER_ALLOW_LARGE=true`. Inference waits while recordings are active.
 
-An unrecognized join page stops after `ZOOM_CONNECT_TIMEOUT=30`; known host and
-waiting-room states retain their separate deadline. `AUDIO_WAIT_TIMEOUT=5`
+An unrecognized join page retries up to `ZOOM_JOIN_ATTEMPTS=3`, each bounded
+by `ZOOM_CONNECT_TIMEOUT=30`. Known host and waiting-room states retain their
+separate deadline and queue position. Current “Host has joined / we've let them
+know you're here” waiting-room text is recognized. Launch Meeting/Open Zoom
+controls and a native protocol navigation for the current meeting trigger the
+Desktop fallback in auto mode. `AUDIO_WAIT_TIMEOUT=5`
 actually bounds waiting for sound. MTProto uses an outgoing-only update handler
 to avoid Pyrofork's closed-SQLite shutdown race.
 
