@@ -73,11 +73,29 @@ class RecordingViewTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_all_corners(1280, 720)
 
     async def test_camera_returns_when_screen_share_stops(self):
+        await self.page.evaluate("window.__zoomyRecordingView.stop();window.__zoomyRecordingSource='shared-and-speaker'")
+        await self.page.evaluate(SCRIPT)
         await self.page.locator('#shared').evaluate('(element)=>element.remove()')
         await self.page.wait_for_function("window.__zoomyRecordingView.status().mode==='active-speaker'")
         await self.page.wait_for_timeout(150)
         pixel = await self.page.evaluate("Array.from(document.querySelector('#zoomy-recording-surface').getContext('2d').getImageData(480,270,1,1).data).slice(0,3)")
         self.assertEqual(pixel, [0,255,255])
+
+    async def test_shared_only_never_shows_camera_or_profile_before_first_share(self):
+        await self.page.locator('#shared').evaluate('(element)=>element.remove()')
+        await self.page.wait_for_function("window.__zoomyRecordingView.status().mode==='waiting'")
+        pixel = await self.page.evaluate("Array.from(document.querySelector('#zoomy-recording-surface').getContext('2d').getImageData(480,270,1,1).data).slice(0,3)")
+        self.assertEqual(pixel, [0,0,0])
+        self.assertTrue(await self.page.locator('#zoomy-recording-surface').is_visible())
+
+    async def test_copy_failure_before_bounds_does_not_expose_camera(self):
+        await self.page.evaluate("window.__zoomyRecordingView.stop()")
+        await self.page.evaluate("() => {CanvasRenderingContext2D.prototype.drawImage=()=>{throw new Error('unavailable media')};}")
+        await self.page.evaluate(SCRIPT)
+        await self.page.wait_for_function("window.__zoomyRecordingView.status().mode==='waiting'")
+        self.assertTrue(await self.page.locator('#zoomy-recording-surface').is_visible())
+        pixel=await self.page.evaluate("Array.from(document.querySelector('#zoomy-recording-surface').getContext('2d').getImageData(480,270,1,1).data).slice(0,3)")
+        self.assertEqual(pixel,[0,0,0])
 
     async def test_portrait_output_removes_only_unused_side_margins(self):
         recorder = ZoomRecorder()

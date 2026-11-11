@@ -95,7 +95,7 @@ async def upload_recording(bot, chat_id: int, path: Path) -> list[int]:
     """
     if not is_configured():
         raise RuntimeError("Set TELEGRAM_UPLOAD_ENABLED, TELEGRAM_API_ID and TELEGRAM_API_HASH")
-    from pyrogram import Client
+    from mtproto_client import UploadOnlyClient
     from pyrogram.errors import FloodWait
     from pyrogram.enums import ParseMode
 
@@ -118,7 +118,7 @@ async def upload_recording(bot, chat_id: int, path: Path) -> list[int]:
             await bot.send_message(chat_id, f"📤 Telegram upload: {path.name}\nPreparing MP4 parts…")
             with tempfile.TemporaryDirectory(prefix="zoomy-upload-", dir=path.parent) as temp:
                 parts = await split_video(path, Path(temp), limit)
-                client = Client(
+                client = UploadOnlyClient(
                     "zoomy-upload", api_id=int(os.environ["TELEGRAM_API_ID"]),
                     api_hash=os.environ["TELEGRAM_API_HASH"],
                     bot_token=os.environ["TELEGRAM_TOKEN"],

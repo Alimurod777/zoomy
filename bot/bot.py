@@ -10,6 +10,7 @@ import random
 import shutil
 import re
 import secrets
+import signal
 import subprocess
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -36,7 +37,7 @@ import telegram_upload as telegram_upload_mod
 from auth_store import auth_store
 from zoom_auth_bot import zoom_auth_bot
 
-from recorder import ZoomRecorder, _display_pool, SILENT_SNOOZE_SECS, BREAKOUT_AUTOJOIN_SECS
+from recorder import ZoomRecorder, _display_pool, SILENT_SNOOZE_SECS, BREAKOUT_AUTOJOIN_SECS, log_zoom_url
 from store import RecordingSession, SessionStore
 
 
@@ -76,7 +77,7 @@ AUTHORIZED_IDS = {
 }
 OWNER_TELEGRAM_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "466165038"))
 DEFAULT_GUEST_NAME = os.environ.get("GUEST_NAME", "zoomy.ircham.dev")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL") or "small"
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "id") or None
 
 WIB = ZoneInfo("Asia/Jakarta")
@@ -142,6 +143,7 @@ store = SessionStore()
 
 _transcription_queue: asyncio.Queue = asyncio.Queue()
 _transcription_busy: bool = False          # True while worker is actively transcribing
+_transcription_task = None
 _pending_transcriptions: dict[str, str] = {}  # session_key → mp4_path
 _pending_send_transcript: dict[str, str] = {}  # token → txt_path
 _pending_youtube_retry: dict[str, str] = {}  # token → mp4_path of a failed upload
@@ -280,8 +282,10 @@ async def _transcription_worker(bot) -> None:
         label = session_key[len("retranscribe/"):] if is_retranscribe else f"Session {session_key}"
         verb = "Retranscribing" if is_retranscribe else "Transcribing"
 
-        await bot.send_message(chat_id, f"{verb} {label} ({model})…")
         try:
+            while store.all_active():
+                await asyncio.sleep(3)  # give live recording priority over inference
+            await bot.send_message(chat_id, f"{verb} {label} ({model})…")
             txt, srt = await transcriber_mod.transcribe(mp4_path, model, WHISPER_LANGUAGE)
             txt_obj = Path(txt)
             # A re-transcription changes timestamp boundaries, so any previously
@@ -316,6 +320,8 @@ async def _transcription_worker(bot) -> None:
                 f"✅ {done_verb} — {label} ({model})\n  {txt_obj.stem}.txt\n  {txt_obj.stem}.srt",
                 reply_markup=InlineKeyboardMarkup(kb_rows),
             )
+        except transcriber_mod.NoSpeechError as e:
+            await bot.send_message(chat_id, f"{label}: {e}")
         except Exception as e:
             await bot.send_message(chat_id, f"Transcription failed ({label}): {e}")
         finally:
@@ -326,6 +332,8 @@ async def _transcription_worker(bot) -> None:
 async def _transcribe_timeout(
     session_key: str, mp4_path: str, chat_id: int, bot, msg_id: int | None = None
 ) -> None:
+    if os.getenv('AUTO_TRANSCRIBE', 'false').lower() != 'true':
+        return
     await asyncio.sleep(100)
     if session_key not in _pending_transcriptions:
         return
@@ -352,6 +360,7 @@ async def _handle_transcribe_callback(update: Update, context: ContextTypes.DEFA
     action, session_key = query.data.split(":", 1)
 
     _MODEL_MAP = {
+        "transcribe_small": "small",
         "transcribe_medium": "medium",
         "transcribe_large":  "large-v3",
     }
@@ -1282,7 +1291,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
     session_num = store.next_num(user_id)
     logger.info(
         "Session %d starting — user_id=%d url=%s guest=%s prefix=%s res=%s display=%s",
-        session_num, user_id, url, guest_name, prefix or "auto", resolution, display_str,
+        session_num, user_id, log_zoom_url(url), guest_name, prefix or "auto", resolution, display_str,
     )
 
     # Message IDs of the active silence warning + its screenshot, so they can be
@@ -1328,9 +1337,11 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
             except Exception as e:
                 logger.warning("Auto share-link creation failed for %s: %s", filename, e)
         rows.append([
+            InlineKeyboardButton("🎙 Small", callback_data=f"transcribe_small:{session_key}"),
             InlineKeyboardButton("🎙 Medium", callback_data=f"transcribe_medium:{session_key}"),
-            InlineKeyboardButton("🎙 Large",  callback_data=f"transcribe_large:{session_key}"),
         ])
+        if os.getenv('WHISPER_ALLOW_LARGE', 'false').lower() == 'true':
+            rows[-1].append(InlineKeyboardButton("🎙 Large", callback_data=f"transcribe_large:{session_key}"))
         rows.append([InlineKeyboardButton("Skip", callback_data=f"skip:{session_key}")])
         keyboard = InlineKeyboardMarkup(rows)
 
@@ -1338,7 +1349,9 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
             chat_id,
             f"Recording saved — Session {session_num}\n"
             f"Folder: {folder}\nDuration: {duration}\nSize: {size}\nReason: {reason}\n\n"
-            f"Transcribe with Whisper? (auto-transcribes with Medium in 100s)",
+            + (f"Auto-transcription: {WHISPER_MODEL} in 100s."
+             if os.getenv('AUTO_TRANSCRIBE', 'false').lower() == 'true'
+             else "Transkripsiya kerak bo‘lsa modelni tanlang. Avtomatik transkripsiya o‘chirilgan."),
             reply_markup=keyboard,
         )
         asyncio.create_task(
@@ -3505,10 +3518,12 @@ def _spawn_transcription_worker(bot) -> None:
     shutdown), it is automatically restarted.  Cancelled tasks are left alone
     so a clean shutdown doesn't loop forever.
     """
+    global _transcription_task
     task = asyncio.create_task(_transcription_worker(bot))
+    _transcription_task = task
 
     def _on_worker_done(t: asyncio.Task) -> None:
-        if t.cancelled():
+        if t.cancelled() or _shutting_down:
             logger.info("Transcription worker cancelled — not restarting")
             return
         exc = t.exception()
@@ -3584,6 +3599,9 @@ async def _post_stop(application: Application) -> None:
     """
     global _shutting_down
     _shutting_down = True
+    if _transcription_task:
+        _transcription_task.cancel()
+        await asyncio.gather(_transcription_task, return_exceptions=True)
     await zoom_auth_bot.close()
     if _auth_sync_task:
         _auth_sync_task.cancel()
@@ -3688,11 +3706,11 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_silence_wait,        pattern=r"^silence_wait:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_breakout_join,       pattern=r"^breakout_join_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_breakout_decline,    pattern=r"^breakout_decline_\d+$"))
-    app.add_handler(CallbackQueryHandler(_handle_transcribe_callback, pattern=r"^(transcribe_medium|transcribe_large|skip):"))
+    app.add_handler(CallbackQueryHandler(_handle_transcribe_callback, pattern=r"^(transcribe_small|transcribe_medium|transcribe_large|skip):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))  # catch-all — must be last
     logger.info("Zoomy bot started (@baboon_zoomy_bot)")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, stop_signals=(signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
 
 
 if __name__ == "__main__":

@@ -5,8 +5,11 @@
 `ZOOM_CLEAN_RECORDING=true` standart holat. Ekran ulashilganda Zoom’ning
 ulashilgan media qatlami to‘liq o‘lchami bilan olinib, yozuvga nisbatini
 saqlagan holda sig‘diriladi (`contain`). Profil tasvirlari, pastki panel va
-ulashish boshqaruvlari bu qatlamga qo‘shilmaydi. Ekran ulashish tugasa,
-asosiy kamera videosi aniqlansa shu video ko‘rsatiladi.
+ulashish boshqaruvlari bu qatlamga qo‘shilmaydi. Standart
+`ZOOM_RECORDING_SOURCE=shared-only`: ekran ulashilmaganida yoki to‘xtaganida
+kamera o‘rniga qora kutish kadri chiqadi, ovoz yozilishi davom etadi.
+Kameraga avtomatik o‘tish faqat `shared-and-speaker` bilan alohida yoqiladi.
+Bu manba tanlash Web App rendereriga tegishli; native Desktop butun kadrni oladi.
 
 `ZOOM_RECORDING_ASPECT=auto` yozuv boshidagi media nisbatiga mos fayl yaratadi:
 tik ekran tik videoga, keng ekran keng videoga tushadi. Faqat renderer yaratgan
@@ -98,6 +101,47 @@ Zoom muayyan xabar/panelni baribir ko‘rsatsa, uning o‘rnini yopish yoki
 kontentni kesish ishlatilmaydi. Brauzerdagi canvas tozalash usuli Web App’ga
 tegishli. Aloqani ilovaning o‘zi tiklashga urinadi; 30 soniyada tiklanmasa
 oldingi yozuv saqlanib jarayon to‘xtaydi.
+
+## Alwaysdata resurslari va ishga tushirish
+
+SSH loginidagi cheklovlarga amal qiling: doimiy botni SSH’da `nohup`, `screen`
+yoki `tmux` bilan qoldirish bu cheklovni bartaraf etmaydi. Pullik tarifdagi
+**Advanced → Services** uchun foreground command:
+
+```text
+/bin/bash /home/telegramdata4/zoomy/scripts/run.sh
+```
+
+Working directory maydoni bo‘lsa `/home/telegramdata4/zoomy`. Bot inbound port
+talab qilmaydi, Telegram’dan polling bilan xabar oladi. Services’ni yoqishdan
+oldin SSH’dagi nusxani to‘xtating; bitta bot tokeni bilan ikkita polling
+nusxasini ochmang. SIGHUP restart signali yozuvlarni yakunlashga va Whisper
+ishchisini to‘xtatishga yo‘naltiriladi. Rasmiy ko‘rsatma:
+https://help.alwaysdata.com/en/docs/web-hosting/services/
+
+Services ishlatilmasa, doimiy jarayonlarga ruxsat berilgan boshqa server kerak.
+Webhook faqat Telegram transportini almashtiradi; Zoom/FFmpeg yozuvi uchun
+uzluksiz jarayon zarurligicha qoladi. Ushbu hujjat Services’ni avtomatik
+sozlamaydi. Resurslarni kamaytirish hosting limitlariga sig‘ishni kafolatlamaydi.
+
+Yengil standart sozlamalar: bitta yozuv, `RECORD_FPS=15`, `FFMPEG_THREADS=2`,
+`WHISPER_THREADS=2`, `WHISPER_MODEL=small`, `AUTO_TRANSCRIBE=false`.
+`large-v3` uchun `WHISPER_ALLOW_LARGE=true` talab qilinadi. Transkripsiya
+navbati faol yozuvlar tugashini kutadi. Har bir ish alohida, pastroq CPU
+ustuvorligidagi jarayonda bajariladi; tugaganda model RAM’dan chiqadi.
+Bekor qilish, shutdown va Linux’da ota jarayon o‘lishi ishchini to‘xtatadi.
+`WHISPER_JOB_TIMEOUT=1800` ish muddatini cheklaydi.
+
+Kichik Silero VAD tekshiruvi nutqni Whisper modelidan oldin qidiradi. Nutq
+bo‘lmasa model yuklanmaydi, til taxmin qilinmaydi va bo‘sh TXT/SRT muvaffaqiyatli
+transkripsiya deb ko‘rsatilmaydi. Video saqlanadi. `AUDIO_WAIT_TIMEOUT` endi
+haqiqiy soniyalik chegara: muddat tugasa video ovoz jim bo‘lsa ham boshlanadi.
+Noma’lum kirish oynasi `ZOOM_CONNECT_TIMEOUT=30` bilan chegaralanadi;
+waiting room va hostni kutish alohida davom etadi.
+
+Atlas URI tanlanganda lokal MongoDB qayta ishga tushirilmaydi. 2026-11-11:
+keraksiz lokal MongoDB va `Killed`dan qolgan loyiha `:99` Xvfb jarayoni
+to‘xtatildi. Yangi ekran ajratishda mavjud X serverning lock fayli o‘chirilmaydi.
 
 ## `venv` va root huquqisiz dasturlar
 

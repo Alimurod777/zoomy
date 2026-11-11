@@ -43,7 +43,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_part_retry_skips_successful_parts(self):
         parts = [self.path, self.path]
-        with patch("pyrogram.Client", return_value=self.context), \
+        with patch("mtproto_client.UploadOnlyClient", return_value=self.context), \
              patch.object(upload, "split_video", new=AsyncMock(return_value=parts)), \
              patch.object(upload, "probe", new=AsyncMock(return_value={"duration": 1})):
             self.client.send_video.side_effect = [SimpleNamespace(id=101), OSError("offline")]
@@ -62,7 +62,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(json.loads(self.path.with_suffix(".telegram.json").read_text())["complete"])
 
     async def test_upload_error_cleans_temporary_parts(self):
-        with patch("pyrogram.Client", return_value=self.context), \
+        with patch("mtproto_client.UploadOnlyClient", return_value=self.context), \
              patch.object(upload, "split_video", new=AsyncMock(side_effect=RuntimeError("split failed"))):
             with self.assertRaises(RuntimeError):
                 await upload.upload_recording(self.bot, 7, self.path)

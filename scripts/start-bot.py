@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -10,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def load_configuration(path):
     load_dotenv(path, override=True)
+    for name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+        os.environ.setdefault(name, '2')
     if os.getenv('TELEGRAM_TOKEN', '') in ('', 'your_bot_token_here'):
         raise ValueError('Set TELEGRAM_TOKEN and your Telegram IDs in .env first.')
 
@@ -19,7 +22,8 @@ def main():
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    if os.getenv('MONGODB_LOCAL_ENABLED', 'false') == 'true':
+    mongo_host = urlparse(os.getenv('MONGODB_URI', '')).hostname
+    if os.getenv('MONGODB_LOCAL_ENABLED', 'false') == 'true' and mongo_host in (None, 'localhost', '127.0.0.1', '::1'):
         subprocess.run([sys.executable, str(ROOT / 'scripts/local-mongo.py'), 'start'], check=True)
     if subprocess.run(['pactl', 'info'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
         subprocess.run(['pulseaudio', '--start', '--exit-idle-time=-1', '--log-level=warning'], check=True)

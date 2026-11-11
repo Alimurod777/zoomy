@@ -1,6 +1,8 @@
 // Draw only meeting media into the recording surface. Never crop the source.
 (() => {
     if (window.__zoomyRecordingView) return;
+    const sharedOnly = window.__zoomyRecordingSource !== 'shared-and-speaker';
+    const fps = Math.max(1, Math.min(30, Number(window.__zoomyRecordingFps) || 15));
     const style = document.createElement('style');
     style.textContent = `
       html[data-zoomy-recording] *, html[data-zoomy-recording] { cursor: none !important; }
@@ -66,7 +68,7 @@
             try {
                 // Capture rendered frames, including WebGL canvases whose drawing
                 // buffer is cleared after presentation. No screen permission needed.
-                stream = source.captureStream(24);
+                stream = source.captureStream(fps);
                 relay = document.createElement('video');
                 relay.muted = relay.playsInline = true;
                 relay.srcObject = stream;
@@ -81,9 +83,10 @@
         if (now - lastProbe >= 250 || !source || !source.isConnected) {
             lastProbe = now;
             const shared = largest(sharedSelectors);
-            select(shared || largest(cameraSelectors), shared ? 'shared-screen' : 'active-speaker');
+            select(shared || (sharedOnly ? null : largest(cameraSelectors)),
+                shared ? 'shared-screen' : 'active-speaker');
         }
-        if (source && now - lastDraw >= 1000 / 24) {
+        if (source && now - lastDraw >= 1000 / fps) {
             const width = Math.max(1, window.innerWidth), height = Math.max(1, window.innerHeight);
             if (surface.width !== width || surface.height !== height) {
                 surface.width = width; surface.height = height;
@@ -101,15 +104,24 @@
                     surface.style.visibility = 'visible';
                     lastDraw = now; frames++;
                 } catch (_) {
-                    // Preserve the complete native view if media cannot be mirrored.
-                    surface.style.visibility = outputRegion ? 'visible' : 'hidden';
-                    selectedMode = outputRegion ? 'waiting' : 'native';
+                    // Strict shared-only mode must not reveal the camera/UI
+                    // when a media copy fails before output bounds are fixed.
+                    const opaque = outputRegion || sharedOnly;
+                    surface.style.visibility = opaque ? 'visible' : 'hidden';
+                    selectedMode = opaque ? 'waiting' : 'native';
+                    if (opaque) {
+                        context.fillStyle = '#000'; context.fillRect(0, 0, width, height);
+                        rectangle = null;
+                    }
                 }
             }
         } else if (!source) {
             // Once the capture area is fixed, never expose unrelated Zoom UI
             // underneath it while a presenter switches media.
-            if (outputRegion) {
+            if (outputRegion || sharedOnly) {
+                if (surface.width !== innerWidth || surface.height !== innerHeight) {
+                    surface.width = innerWidth; surface.height = innerHeight;
+                }
                 context.fillStyle = '#000'; context.fillRect(0, 0, surface.width, surface.height);
                 surface.style.visibility = 'visible'; selectedMode = 'waiting';
             } else { surface.style.visibility = 'hidden'; selectedMode = 'native'; }

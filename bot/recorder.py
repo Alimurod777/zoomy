@@ -44,7 +44,7 @@ ZOOM_STATE_PATH = Path(os.environ.get("ZOOM_STATE_PATH", "/secrets/zoom_state.js
 # ── Audio-wait settings ───────────────────────────────────────────────────────
 # How long (seconds) to wait for audio before starting the recording anyway.
 # Set to 0 to disable the feature and start FFmpeg immediately on join.
-AUDIO_WAIT_TIMEOUT = int(os.environ.get("AUDIO_WAIT_TIMEOUT", "300"))
+AUDIO_WAIT_TIMEOUT = int(os.environ.get("AUDIO_WAIT_TIMEOUT") or "5")
 # Minimum RMS level (out of 32 767) considered "audio present".
 AUDIO_RMS_THRESHOLD = int(os.environ.get("AUDIO_RMS_THRESHOLD", "100"))
 _AUDIO_SAMPLE_RATE = 16_000   # Hz — enough for level detection, low CPU
@@ -69,7 +69,7 @@ Callback = Callable[..., Awaitable[None]]
 def parse_zoom_url(url: str) -> tuple[str, str]:
     match = re.search(r"/(?:j|wc)/(\d+)", url)
     if not match:
-        raise ValueError(f"No meeting ID found in: {url}")
+        raise ValueError("No meeting ID found in Zoom invitation")
     meeting_id = match.group(1)
     params = parse_qs(urlparse(url).query)
     password = params.get("pwd", [""])[0]
@@ -123,6 +123,13 @@ class DisplayPool:
         self._lock = asyncio.Lock()
         self._procs: dict[int, subprocess.Popen] = {}  # display_num → Xvfb proc
 
+    @staticmethod
+    def _unload_sinks(names):
+        result = subprocess.run(['pactl', 'list', 'short', 'modules'], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if any('sink_name='+name in line.split() for name in names):
+                subprocess.run(['pactl', 'unload-module', line.split()[0]], capture_output=True)
+
     async def _ensure_pulseaudio(self) -> None:
         """Restart PulseAudio if it's not responding."""
         check = subprocess.run(["pactl", "info"], capture_output=True)
@@ -139,11 +146,15 @@ class DisplayPool:
         """Allocate a display slot. Returns (display_num, ':N', 'virtual_N.monitor')."""
         async with self._lock:
             await self._ensure_pulseaudio()
-            for n in range(self._base, self._base + self._max):
+            if len(self._procs) >= self._max:
+                raise RuntimeError(f"No available display slots (max {self._max})")
+            for n in range(self._base, self._base + max(20, self._max)):
                 if n not in self._procs:
                     lock_file = f"/tmp/.X{n}-lock"
                     if os.path.exists(lock_file):
-                        os.remove(lock_file)
+                        # Another bot or an orphan may still own this X server.
+                        # Never remove a live server's lock and reuse its screen.
+                        continue
                     proc = subprocess.Popen(
                         [
                             "Xvfb", f":{n}",
@@ -158,17 +169,15 @@ class DisplayPool:
                         raise RuntimeError(f"Xvfb could not start on :{n}")
                     sink = f"virtual_{n}"
                     try:
-                        subprocess.run(
-                            [
-                                "pactl", "load-module", "module-null-sink",
-                                f"sink_name={sink}",
-                                f"sink_properties=device.description={sink}",
-                            ],
-                            check=True,
-                            capture_output=True,
-                        )
+                        self._unload_sinks({sink, sink+'_mic'})
+                        for name in (sink, sink+'_mic'):
+                            subprocess.run(
+                                ['pactl', 'load-module', 'module-null-sink', f'sink_name={name}',
+                                 f'sink_properties=device.description={name}'],
+                                check=True, capture_output=True)
                     except subprocess.CalledProcessError as e:
                         proc.terminate()
+                        self._unload_sinks({sink, sink+'_mic'})
                         raise RuntimeError(f"Failed to create audio sink: {e.stderr.decode().strip()}") from e
                     self._procs[n] = proc
                     logger.info("DisplayPool: allocated :%d / %s", n, sink)
@@ -187,14 +196,7 @@ class DisplayPool:
                     proc.kill()
             sink = f"virtual_{display_num}"
             try:
-                result = subprocess.run(
-                    ["pactl", "list", "short", "modules"],
-                    capture_output=True, text=True,
-                )
-                for line in result.stdout.splitlines():
-                    if sink in line:
-                        subprocess.run(["pactl", "unload-module", line.split()[0]])
-                        break
+                self._unload_sinks({sink, sink+'_mic'})
             except Exception as e:
                 logger.warning("Could not unload sink %s: %s", sink, e)
             logger.info("DisplayPool: released :%d", display_num)
@@ -203,9 +205,14 @@ class DisplayPool:
 # Concurrent recording sessions. Each takes an Xvfb display + PulseAudio sink,
 # plus a Chrome and an FFmpeg — so this is really a host-resource ceiling. It
 # caps how many breakout rooms can be covered at once, one bot per room.
-MAX_CONCURRENT_SESSIONS = int(os.environ.get("MAX_CONCURRENT_SESSIONS", "5"))
+MAX_CONCURRENT_SESSIONS = int(os.environ.get("MAX_CONCURRENT_SESSIONS") or "1")
 
 _display_pool = DisplayPool(max_slots=MAX_CONCURRENT_SESSIONS)
+
+
+def log_zoom_url(url):
+    parsed = urlparse(url)
+    return parsed._replace(query='', fragment='').geturl()
 
 
 def _reserve_recording_dir(prefix: str, datestamp: str) -> Path:
@@ -584,7 +591,7 @@ class ZoomRecorder:
                 return
             web_url = build_web_client_url(url)
 
-            logger.info("Joining %s (display=%s)", web_url, self.display)
+            logger.info("Joining %s (display=%s)", log_zoom_url(web_url), self.display)
 
             # Pin this session's Chrome to its own display *and* its own audio
             # sink. Without PULSE_SINK every Chrome plays into PulseAudio's
@@ -596,6 +603,7 @@ class ZoomRecorder:
                 **os.environ,
                 "DISPLAY": self.display,
                 "PULSE_SINK": self.sink_name,
+                "PULSE_SOURCE": self.sink_name + '_mic.monitor',
             }
             logger.info(
                 "Session env — DISPLAY=%s PULSE_SINK=%s (recording %s)",
@@ -611,7 +619,6 @@ class ZoomRecorder:
                         "--disable-setuid-sandbox",
                         "--disable-dev-shm-usage",
                         "--use-fake-ui-for-media-stream",
-                        "--use-fake-device-for-media-stream",
                         "--autoplay-policy=no-user-gesture-required",
                         "--disable-blink-features=AutomationControlled",
                         "--start-maximized",
@@ -863,14 +870,21 @@ class ZoomRecorder:
     async def _prepare_recording_view(self, page: Page) -> None:
         if os.getenv("ZOOM_CLEAN_RECORDING", "true").lower() != "true":
             return
+        source = os.getenv("ZOOM_RECORDING_SOURCE") or "shared-only"
+        if source not in {"shared-only", "shared-and-speaker"}:
+            raise ValueError("Invalid ZOOM_RECORDING_SOURCE")
         try:
             script = Path(__file__).with_name("recording_view.js").read_text()
+            await page.evaluate("settings=>{window.__zoomyRecordingSource=settings.source;window.__zoomyRecordingFps=settings.fps}",
+                                {"source": source, "fps": int(os.getenv("RECORD_FPS") or "15")})
             await page.evaluate(script)
             if self._capture_bounds:
                 await page.evaluate("bounds=>window.__zoomyRecordingView.setOutputRegion(bounds)", self._capture_bounds)
             await page.mouse.move(0, 0)
-            logger.info("Clean recording view enabled: shared screen first, full source preserved")
+            logger.info("Clean recording view enabled (%s); complete source retained", source)
         except Exception as exc:
+            if source == 'shared-only':
+                raise RuntimeError('Ulashilgan ekran uchun himoyalangan ko‘rinish tayyorlanmadi; kamera yozuvi boshlanmadi.') from None
             if self._capture_bounds:
                 raise RuntimeError("Could not restore the fixed recording area after reconnection") from None
             logger.warning("Clean recording view unavailable (%s); keeping the complete native view", type(exc).__name__)
@@ -1310,12 +1324,15 @@ class ZoomRecorder:
         _PAGE_POLL_SECS = 3.0
         last_page_poll = 0.0
         logger.info(
-            "Waiting for audio on %s (threshold=%d RMS, no timeout)",
-            self.sink, AUDIO_RMS_THRESHOLD,
+            "Waiting for audio on %s (threshold=%d RMS, timeout=%ds)",
+            self.sink, AUDIO_RMS_THRESHOLD, AUDIO_WAIT_TIMEOUT,
         )
 
         try:
             while not self._stop_event.is_set():
+                if time.monotonic() - start >= AUDIO_WAIT_TIMEOUT:
+                    logger.info("Audio wait deadline reached; starting recording with the current audio stream")
+                    return
                 # parec exited early (e.g. sink not ready yet)
                 if proc.returncode is not None:
                     logger.warning(
@@ -1574,6 +1591,8 @@ class ZoomRecorder:
         failures = 0
         navigate = not resume_waiting_room
         attempt_start = time.monotonic()
+        connecting_since = time.monotonic()
+        connect_timeout = max(10, int(os.getenv("ZOOM_CONNECT_TIMEOUT") or "30"))
         while not self._stop_event.is_set() and time.monotonic() < deadline:
             if navigate:
                 attempt_start = time.monotonic()
@@ -1618,6 +1637,10 @@ class ZoomRecorder:
                 return True
             if state in {"auth_required", "invalid", "passcode", "app_required", "removed", "ended"}:
                 raise self._join_exception(state)
+            if state in {"waiting_room", "waiting_host"}:
+                connecting_since = time.monotonic()
+            elif time.monotonic() - connecting_since >= connect_timeout:
+                raise MeetingJoinError(f"Zoom kirish oynasi {connect_timeout} soniyada tayyor bo‘lmadi. /record bilan qayta urinib ko‘ring.")
             await self._notice_admission(state)
             elapsed = time.monotonic() - attempt_start
             if state == "waiting_room":
@@ -1907,9 +1930,10 @@ class ZoomRecorder:
         cmd = [
             "ffmpeg", "-y",
             "-loglevel", "warning", "-nostats",
-            "-f", "x11grab", "-draw_mouse", "0", "-r", "24", "-s", "1920x1200", "-i", self.display,
+            "-f", "x11grab", "-draw_mouse", "0", "-r", str(max(1,min(30,int(os.getenv("RECORD_FPS") or "15")))) , "-s", "1920x1200", "-i", self.display,
             "-f", "pulse", "-i", self.sink,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+            "-threads", str(max(1,min(8,int(os.getenv("FFMPEG_THREADS") or "2")))),
             "-pix_fmt", "yuv420p",
         ]
         vf = self._build_vf(chrome_height)

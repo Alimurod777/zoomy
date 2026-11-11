@@ -123,6 +123,29 @@ Set `AUTO_RECORD_SETUP=false` for the manual name and scheduling flow below.
 
 Multiple concurrent recordings are supported. Each session gets its own isolated display and audio sink. Per-user isolation: each authorized user manages only their own sessions.
 
+## Shared-host resource defaults
+
+Web recordings default to `ZOOM_RECORDING_SOURCE=shared-only`: absent a screen
+share, the renderer shows black while audio continues, rather than switching to
+someone's camera. Set `shared-and-speaker` to restore camera fallback. Chromium
+no longer supplies a synthetic test camera/microphone. Native Desktop keeps its
+own full-frame behavior.
+
+Defaults are one recording, 15 FPS, two FFmpeg threads, and manual transcription
+(`AUTO_TRANSCRIBE=false`). Whisper uses a separate, lower-priority worker with
+two threads and releases model memory on exit. Speech is checked before loading
+a model; silence produces a clear no-speech result. Large models require
+`WHISPER_ALLOW_LARGE=true`. Inference waits while recordings are active.
+
+An unrecognized join page stops after `ZOOM_CONNECT_TIMEOUT=30`; known host and
+waiting-room states retain their separate deadline. `AUDIO_WAIT_TIMEOUT=5`
+actually bounds waiting for sound. MTProto uses an outgoing-only update handler
+to avoid Pyrofork's closed-SQLite shutdown race.
+
+On Alwaysdata, use the foreground command in [the setup guide](docs/setup-uz.md)
+under Advanced → Services, rather than leaving a bot running on the SSH host.
+Services are available on paid plans; resource limits still apply.
+
 ## Stack
 
 | Component | Role |
@@ -188,7 +211,7 @@ RECORDINGS_DIR=/recordings
 ZOOM_STATE_PATH=/secrets/zoom_state.json  # saved Zoom login; see "Signed-in join". Missing file = anonymous guest join
 DEBUG=false                               # set true to save debug screenshots
 
-WHISPER_MODEL=medium                      # tiny | base | small | medium | large-v3
+WHISPER_MODEL=small                       # tiny | base | small | medium; large requires opt-in
 WHISPER_LANGUAGE=id                       # BCP-47 code, or leave empty for auto-detect
 WHISPER_THREADS=                          # CPU threads (defaults to all cores)
 
@@ -395,7 +418,7 @@ Zoomy uses **faster-whisper** for local, CPU-only transcription (no cloud API ne
 
 | Setting | Default | Notes |
 |---|---|---|
-| `WHISPER_MODEL` | `medium` | `tiny` / `base` / `small` / `medium` / `large-v3` |
+| `WHISPER_MODEL` | `small` | `tiny` / `base` / `small` / `medium` / `large-v3` |
 | `WHISPER_LANGUAGE` | `id` | BCP-47 code; leave empty for auto-detect |
 | `WHISPER_THREADS` | all cores | CPU thread count |
 
@@ -453,7 +476,7 @@ Schedules persist across bot restarts via `recordings/schedules.json`. On startu
 - ~~**Breakout room invite**~~ ✅ — when the host invites the bot to a breakout room, a Telegram prompt (with live screenshot) offers **✅ Join** / **✋ Not Now**. If nobody answers within `BREAKOUT_AUTOJOIN_SECS` (default 100s) the bot auto-joins; the chosen button is then clicked on the virtual screen. Only host-initiated invites are acted on. Set `BREAKOUT_AUTOJOIN_SECS=0` to join immediately, or a negative value to ignore invites.
 
   Because hosts routinely set breakout rooms up in a *silent* meeting, the invite gets priority over the audio-silence machinery in two ways:
-  - **Detected before recording starts** — invites are polled during the audio wait too, not just in the main watch loop. Otherwise a bot parked in "waiting for audio" (an unbounded wait) would never see the invite until the meeting made a sound.
+  - **Detected before recording starts** — invites are polled during the audio wait too, not just in the main watch loop. Otherwise a bot parked in "waiting for audio" (a bounded wait) would never see the invite until the meeting made a sound.
   - **Outranks silence handling** — if an invite appears while a silence warning/pause is active, the silence treatment is cancelled (the encoder resumes if it was paused) and the silence Telegram message + screenshot are deleted, keeping the user focused on the invite.
 
   Zoom stacks the invite on top of other modals (e.g. "This meeting is recorded"), so the invite dialog is located by anchoring on its **Not Now** button and walking up to the smallest ancestor holding both the **Join** button and the invite text — matching an outer container would mix both dialogs' text and buttons together. The notice underneath is dismissed normally, with the invite's own buttons protected.
