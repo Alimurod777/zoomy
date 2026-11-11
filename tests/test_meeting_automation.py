@@ -161,6 +161,45 @@ class BrowserAdmissionTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.pw.stop()
 
+    async def test_exact_workplace_invitation_routes_to_desktop_before_rewrite(self):
+        invite='https://zoom.us/j/97856007427?pwd=example'
+        requested=[]
+        async def route(r):
+            requested.append(r.request.url)
+            await r.fulfill(body='<h1>Join meeting</h1><button>Join from Zoom Workplace app</button><p>Don’t have the Zoom Workplace app installed? Download Now</p>',content_type='text/html')
+        await self.page.route(invite,route)
+        recorder=ZoomRecorder();recorder.current_url=invite
+        with patch.dict(os.environ,ZOOM_JOIN_MODE='auto'):
+            with self.assertRaises(recorder_module.DesktopRequired):
+                await recorder._choose_join_target(self.page,invite,URL)
+        self.assertEqual(requested,[invite])
+
+    async def test_explicit_browser_option_keeps_the_web_route(self):
+        invite='https://zoom.us/j/97856007427?pwd=example'
+        async def route(r):
+            await r.fulfill(body='<button>Join from Zoom Workplace app</button><a href="#">Join from Your Browser</a>',content_type='text/html')
+        await self.page.route(invite,route)
+        recorder=ZoomRecorder();recorder.current_url=invite;recorder._native_handoff_seen=True
+        target,resume=await recorder._choose_join_target(self.page,invite,URL)
+        self.assertEqual(target,URL)
+        self.assertFalse(resume)
+        self.assertFalse(recorder._native_handoff_seen)
+
+    async def test_delayed_name_input_is_filled_and_mute_is_not_used_as_join(self):
+        html='''<div id="root"></div><script>window.mutes=0;window.joins=0;
+        setTimeout(()=>{document.querySelector('#root').innerHTML=`
+        <button type="submit" onclick="window.mutes++">Mute</button>
+        <input id="input-for-name" type="text" oninput="document.querySelector('#join-real').disabled=!this.value">
+        <button id="join-real" disabled onclick="window.joins++;this.outerHTML='<button class=footer__leave-btn>Leave</button>'">Join</button>`;},1400);</script>'''
+        async def route(r):await r.fulfill(body=html,content_type='text/html')
+        await self.page.route(URL,route)
+        recorder=ZoomRecorder(guest_name='Zoomy Recorder',use_profile_name=False)
+        recorder._join_audio=AsyncMock()
+        self.assertTrue(await asyncio.wait_for(recorder._join_meeting(self.page,URL),10))
+        self.assertEqual(await self.page.locator('#input-for-name').input_value(),'Zoomy Recorder')
+        self.assertEqual(await self.page.evaluate('window.joins'),1)
+        self.assertEqual(await self.page.evaluate('window.mutes'),1)
+
     async def test_current_waiting_room_copy_is_not_a_missing_join_form(self):
         async def route(r):
             await r.fulfill(body="<div class='speaker-active-container__wrap'><video></video></div><p>Host has joined. We've let them know you're here.</p>",content_type='text/html')

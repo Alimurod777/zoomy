@@ -584,15 +584,16 @@ class ZoomRecorder:
         self._started_at = datetime.now()
 
         try:
-            mode = (os.getenv("ZOOM_JOIN_MODE") or "auto").lower()
+            mode = (os.getenv("ZOOM_JOIN_MODE") or "auto").strip().lower()
             if mode not in {"auto", "web", "desktop"}:
                 raise ValueError("ZOOM_JOIN_MODE must be auto, web or desktop")
             if mode == "desktop":
+                logger.info("Joining directly with native Zoom Desktop (display=%s)", self.display)
                 await self._record_native(url)
                 return
             web_url = build_web_client_url(url)
 
-            logger.info("Joining %s (display=%s)", log_zoom_url(web_url), self.display)
+            logger.info("Preparing Zoom invitation %s (display=%s)", log_zoom_url(url), self.display)
 
             # Pin this session's Chrome to its own display *and* its own audio
             # sink. Without PULSE_SINK every Chrome plays into PulseAudio's
@@ -646,8 +647,11 @@ class ZoomRecorder:
                 )
                 page = await ctx.new_page()
                 await self._monitor_desktop_handoff(page)
-
-                if not await self._join_meeting(page, web_url):
+                resume_current_page = False
+                if mode == 'auto':
+                    web_url, resume_current_page = await self._choose_join_target(page, url, web_url)
+                logger.info("Joining Web App %s (display=%s)", log_zoom_url(web_url), self.display)
+                if not await self._join_meeting(page, web_url, resume_waiting_room=resume_current_page):
                     return
                 await self._prepare_recording_view(page)
                 # Measure browser chrome height for cropping
@@ -717,6 +721,7 @@ class ZoomRecorder:
             # Playwright has closed before native Zoom takes the same display
             # and sink. No simultaneous duplicate participant/audio capture.
             try:
+                logger.info("Switching to native Zoom Desktop (display=%s)", self.display)
                 await self._record_native(url)
             except Exception as exc:
                 self._session_errored = self._session_errored or self.output_path is None
@@ -1474,6 +1479,45 @@ class ZoomRecorder:
             # DOM detection still handles ordinary Launch Meeting pages.
             logger.debug('Native launch protocol monitor unavailable')
 
+    async def _choose_join_target(self, page, invitation, web_url):
+        """Inspect the real invitation before replacing it with a /wc URL.
+
+        An app-only invitation can request zoommtg:// while its manually-built
+        web-client URL merely sits on a preview form. Rewriting first discarded
+        precisely the information needed to select the desktop client.
+        """
+        if self._stop_event.is_set() or '/wc/' in urlparse(invitation).path:
+            return web_url, False
+        deadline = time.monotonic() + 10
+        try:
+            await page.goto(invitation, wait_until='domcontentloaded', timeout=8000)
+        except Exception:
+            if self._stop_event.is_set():
+                return web_url, False
+        while not self._stop_event.is_set() and time.monotonic() < deadline:
+            browser_link = page.get_by_text(re.compile(r'join from (?:your |the )?browser', re.I))
+            if await browser_link.count() and await browser_link.first.is_visible():
+                self._native_handoff_seen = False
+                return web_url, False
+            try:
+                state = await self._state(page)
+            except Exception:
+                if self._native_handoff_seen:
+                    raise self._join_exception('app_launch')
+                state = 'connecting'
+            if state in {'app_launch', 'app_required'}:
+                logger.info('Invitation requests Zoom Desktop; skipping web-client preview')
+                raise self._join_exception(state)
+            if state in {'admitted', 'waiting_room', 'waiting_host'}:
+                return web_url, True
+            if state in {'auth_required', 'removed', 'ended', 'invalid', 'passcode'}:
+                raise self._join_exception(state)
+            if await self._wait_or_stop(0.25):
+                break
+        if self._native_handoff_seen:
+            raise self._join_exception('app_launch')
+        return web_url, False
+
     async def _wait_or_stop(self, seconds: float) -> bool:
         try:
             await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
@@ -1708,6 +1752,22 @@ class ZoomRecorder:
         await page.goto(web_url, wait_until="domcontentloaded", timeout=18_000)
         if await self._wait_or_stop(0.5):
             return
+        try:
+            if await self._state(page) in {'admitted', 'waiting_room', 'waiting_host'}:
+                return
+        except Exception:
+            pass
+        try:
+            # Zoom hydrates its React preview after DOMContentLoaded. A single
+            # check at 0.5s misses the name input and then waits on disabled Join.
+            await page.wait_for_function(r'''() => {
+                const visible=e=>{const r=e.getBoundingClientRect();return r.width>1&&r.height>1&&getComputedStyle(e).visibility!=='hidden'};
+                return [...document.querySelectorAll('input[type="text"],input#input-for-name,button.footer__leave-btn,[role="dialog"],a[href^="zoommtg:"]')].some(visible)
+                    || [...document.querySelectorAll('button')].some(e=>visible(e)&&/^(join|join meeting|launch meeting|join from zoom workplace app)$/i.test(e.innerText.trim()));
+            }''', timeout=6000)
+        except Exception:
+            if self._stop_event.is_set():
+                return
         await self._screenshot(page, "01_initial")
 
         # Detect invalid / expired meeting before doing anything else
@@ -1770,6 +1830,7 @@ class ZoomRecorder:
                 raise MeetingJoinError(self._join_error("passcode"))
 
         NAME_SELECTORS = [
+            'input#input-for-name',
             'input[placeholder="Your Name"]',
             'input[placeholder="your name"]',
             'input#inputname',
@@ -1807,9 +1868,9 @@ class ZoomRecorder:
 
         JOIN_SELECTORS = [
             'button.preview-join-button',
-            'button[type="submit"]',
-            'input[type="submit"]',
-            'button[class*="join" i]',
+            'button#joinBtn',
+            'button[data-testid="join-button"]',
+            'input[type="submit"][value="Join" i]',
         ]
         join_clicked = False
         for sel in JOIN_SELECTORS:
@@ -1824,7 +1885,7 @@ class ZoomRecorder:
                 continue
         if not join_clicked:
             try:
-                btn = page.get_by_role("button", name=re.compile(r"join", re.I))
+                btn = page.get_by_role("button", name=re.compile(r"^\s*join(?: meeting)?\s*$", re.I))
                 await btn.first.click(timeout=5_000)
                 join_clicked = True
                 logger.info("Join clicked via role fallback")

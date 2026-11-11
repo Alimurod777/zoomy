@@ -3710,6 +3710,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))  # catch-all — must be last
     logger.info("Zoomy bot started (@baboon_zoomy_bot)")
+    logger.info("Zoom join mode: %s", (os.getenv('ZOOM_JOIN_MODE') or 'auto').strip().lower())
     app.run_polling(drop_pending_updates=True, stop_signals=(signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
 
 

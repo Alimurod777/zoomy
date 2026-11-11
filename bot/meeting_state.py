@@ -46,7 +46,7 @@ SNAPSHOT_JS = r'''() => {
     // Chat messages/captions must not be mistaken for host or network notices.
     const notices=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[role="alert"],.zm-modal,.reconnecting-dialog')]
         .filter(visible).map(el=>el.innerText||'').join(' ');
-    const launchLabels=/^(launch (meeting|zoom(?: workplace)?)|open zoom(?: meetings| workplace| app)?|join (?:from|in) (?:the )?app|открыть zoom|запустить конференцию)$/i;
+    const launchLabels=/^(launch (meeting|zoom(?: workplace)?)|open zoom(?: meetings| workplace| app)?|join (?:from|in) (?:the )?app|join from (?:the )?zoom workplace app|открыть zoom|запустить конференцию)$/i;
     const app_launch=!admitted&&[...document.querySelectorAll('a,button,[role="button"]')].some(el=>
         visible(el)&&(launchLabels.test((el.innerText||el.getAttribute('aria-label')||'').trim())
             || /^(zoommtg|zoomus):\/\//i.test(el.getAttribute('href')||'')));

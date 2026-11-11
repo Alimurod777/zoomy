@@ -83,8 +83,10 @@ waiting rooms keep their queue position. Transient disconnects retry up to
 `ZOOM_RECONNECT_ATTEMPTS=5`, preserving and merging recorded segments.
 A host ending the meeting or removing the bot stops the recording.
 
-`ZOOM_JOIN_MODE=auto` first uses the Web App and switches to the official
-Linux Zoom Desktop client on an explicit app-only requirement. Install it with
+`ZOOM_JOIN_MODE=auto` first opens the original invitation. A “Join from Zoom
+Workplace app” button or a matching native protocol request selects the official
+Linux Zoom Desktop client before any `/wc/.../join` rewrite. An explicit
+“Join from Your Browser” option keeps the Web App route. Install it with
 `bash scripts/setup-zoom-desktop.sh` after the runtime setup. Use `web` to
 prevent fallback or `desktop` to force the native client when a browser cannot
 identify the restriction. Native support is experimental: admission is checked

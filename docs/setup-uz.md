@@ -50,8 +50,10 @@ urinadi. Oldingi yozuv bo‘laklari saqlanadi va birlashtiriladi; tiklanish
 oralig‘i yozuvga kiritilmaydi. Host efirni tugatsa yoki botni chiqarsa yozuv
 to‘xtaydi. Qo‘lda ism tanlash va rejalashtirish uchun `AUTO_RECORD_SETUP=false`.
 
-`ZOOM_JOIN_MODE=auto` avval Web App orqali kiradi. Faqat ilovadan kirish
-talabi aniq ko‘rsatilsa, haqiqiy Linux Zoom Desktop’ga o‘tadi. Cheklov sahifada
+`ZOOM_JOIN_MODE=auto` avval asl taklif havolasini tekshiradi. Sahifa
+**Join from Zoom Workplace app** desa yoki joriy meeting uchun `zoommtg://`
+so‘rovini yuborsa, Web App URL’iga almashtirmasdan haqiqiy Linux Zoom
+Desktop’ga o‘tadi. **Join from Your Browser** varianti bo‘lsa Web App tanlanadi. Cheklov sahifada
 aniqlanmayotgan bo‘lsa `ZOOM_JOIN_MODE=desktop` bilan to‘g‘ridan-to‘g‘ri
 ilovadan kirish mumkin. `web` faqat brauzer yo‘lini ishlatadi.
 
