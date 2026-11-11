@@ -15,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 from meeting_state import classify_meeting
 from login_link import BrowserLoginLink
 from aiohttp import web
+from desktop_auth_store import DesktopAuthStore, AuthStoreError
 
 ROOT = Path(__file__).resolve().parents[1]
 logger = logging.getLogger(__name__)
@@ -73,16 +74,22 @@ class NativeDesktopLink(BrowserLoginLink):
     async def index(self, request):
         response = await super().index(request)
         html = response.text
-        # Remove the browser login save control; native auth is local to Zoom.
+        # A consistent native snapshot requires closing Zoom first.
         html = html.replace('id="save"', 'id="save" hidden')
         html = html.replace('Loginni saqlash', 'Zoom Desktop').replace('Zoom login', 'Zoom Desktop')
         return web.Response(text=html, content_type='text/html')
 
     async def status(self, request):
-        return web.json_response({'phase': 'manual', 'message': 'Zoom Desktop maydonini bosing, so‘ng matn kiriting yoki o‘chiring. Akkauntga kirgach login Zoom tomonidan shu serverda saqlanadi; “Keep me signed in” bo‘lsa belgilang.'})
+        sync = getattr(self.browser, 'profile_sync', 'disabled')
+        detail = {
+            'disabled': 'Profil shu serverda saqlanadi; MongoDB nusxalash o‘chirilgan.',
+            'conflict': 'Mahalliy profil MongoDB nusxasidan farq qiladi; umumiy nusxa almashtirilmaydi.',
+            'unavailable': 'MongoDB sinxronlash bajarilmadi; mahalliy profil saqlanadi.',
+        }.get(sync, 'Profil Zoom yopilgach MongoDB’ga shifrlab nusxalanadi; boshqa serverda qayta login so‘ralishi mumkin.')
+        return web.json_response({'phase': 'manual', 'message': 'Zoom Desktop maydonini bosing, so‘ng matn kiriting yoki o‘chiring. “Keep me signed in” bo‘lsa belgilang. ' + detail})
 
     async def save(self, request):
-        return web.json_response({'ok': False, 'message': 'Desktop logini ilovaning o‘zida saqlanadi. MongoDB brauzer sessiyasini saqlaydi.'}, status=409)
+        return web.json_response({'ok': False, 'message': 'Desktop profilining nusxasi Zoom yopilgach avtomatik saqlanadi. Hozir Zoom oynasida davom eting.'}, status=409)
 
     async def reload(self, request):
         return web.json_response({'ok': True, 'message': 'Zoom Desktop oynasida davom eting.'})
@@ -151,6 +158,8 @@ class NativeZoom:
         self._fullscreen_window_id = None
         self._share_panel_hidden = False
         self._last_view_attempt = float('-inf')
+        self.auth_store = DesktopAuthStore()
+        self.profile_sync = 'disabled'
         self.env = {**os.environ, 'DISPLAY': display, 'PULSE_SINK': sink,
                     'LIBGL_ALWAYS_SOFTWARE': '1', 'QT_QPA_PLATFORM': 'xcb',
                     'OMP_THREAD_LIMIT': '2', 'OMP_NUM_THREADS': '2',
@@ -186,6 +195,16 @@ class NativeZoom:
             self.lock_file.close()
             self.lock_file = None
             raise RuntimeError('Zoom Desktop boshqa yozuvda band. U tugagach qayta urinib ko‘ring.') from None
+        try:
+            outcome = await self.auth_store.prepare()
+            self.profile_sync = outcome
+            logger.info('Desktop profile sync: %s (profile restore does not verify account login)', outcome)
+            if outcome == 'conflict':
+                logger.warning('Local Desktop profile differs from another server; neither profile will be overwritten')
+        except Exception as exc:
+            self.profile_sync = 'unavailable'
+            logger.warning('Desktop profile sync unavailable: %s; keeping local profile',
+                           str(exc) if isinstance(exc, AuthStoreError) else type(exc).__name__)
         # A dedicated silent microphone prevents capturing the server/user's
         # microphone even if Zoom resets its own mute preference.
         mic = f'zoomy_native_mic_{self.display_num}'
@@ -326,6 +345,7 @@ class NativeZoom:
             pass
 
     async def close(self):
+        graceful = self.process is not None and self.process.returncode != -signal.SIGKILL
         if self.link:
             try:
                 await self.link.close()
@@ -340,8 +360,19 @@ class NativeZoom:
                     await asyncio.wait_for(proc.wait(), 5)
                 except (ProcessLookupError, asyncio.TimeoutError):
                     if proc.returncode is None:
+                        if proc is self.process:
+                            graceful = False
                         os.killpg(proc.pid, signal.SIGKILL)
                         await proc.wait()
+        try:
+            if graceful:
+                outcome = await self.auth_store.backup()
+                logger.info('Desktop profile backup: %s (account login not verified)', outcome)
+        except Exception as exc:
+            logger.warning('Desktop profile backup failed: %s; local profile preserved',
+                           str(exc) if isinstance(exc, AuthStoreError) else type(exc).__name__)
+        finally:
+            await self.auth_store.close()
         if self.mic_module:
             await self.command('pactl', 'unload-module', self.mic_module)
             self.mic_module = None

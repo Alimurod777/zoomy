@@ -5,6 +5,7 @@ Requires bot requirements except faster-whisper (audio inference is not exercise
 """
 import asyncio
 import importlib.util
+import logging
 import os
 from pathlib import Path
 import sys
@@ -21,7 +22,15 @@ with tempfile.TemporaryDirectory() as log_dir:
     sys.modules[spec.name] = bot
     with patch.dict(os.environ, TELEGRAM_TOKEN='123:offline-test', RECORDINGS_DIR=log_dir), \
          patch.dict(sys.modules, transcriber=types.ModuleType('transcriber')):
-        spec.loader.exec_module(bot)
+        previous_handlers = set(logging.getLogger().handlers)
+        try:
+            spec.loader.exec_module(bot)
+        finally:
+            # Close the imported bot's log before deleting its temporary folder.
+            # On NFS an open, unlinked log leaves a .nfs file and cleanup fails.
+            for handler in set(logging.getLogger().handlers) - previous_handlers:
+                logging.getLogger().removeHandler(handler)
+                handler.close()
 
 
 class BotFlowTests(unittest.IsolatedAsyncioTestCase):

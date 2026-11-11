@@ -80,9 +80,20 @@ kirgach, Zoom o‘zining mahalliy profilida (`~/.zoom/data`, sozlamalari
 **Keep me signed in** varianti bo‘lsa uni belgilang. Bot bu kataloglarni har
 bir yozuvdan keyin o‘chirmaydi va akkauntdan Sign out qilmaydi. Sessiya Zoom
 tomonidan bekor qilinsa yoki muddati tugasa qayta login kerak bo‘lishi mumkin.
-Boshqa serverga Desktop loginini ko‘chirish yoki MongoDB orqali sinxronlash
-hozir amalga oshirilmagan; MongoDB’dagi browser cookie’lari Native login
-hisoblanmaydi. MongoDB sinxronlash hozir brauzer sessiyasiga tegishli. Login yoki
+`ZOOM_DESKTOP_SYNC=true` (standart) va MongoDB sozlangan bo‘lsa, Zoom odatiy
+yopilgach asosiy profil bazalari va Zoom sozlamalarining shifrlangan nusxasi
+alohida `desktop_auth` kolleksiyasiga saqlanadi. Mavjud `MONGODB_AUTH_KEY` va
+`ZOOM_AUTH_ID` ishlatiladi; yangi kalit talab qilinmaydi. Keyingi ochilishdan
+oldin mahalliy profil bo‘sh bo‘lsa nusxa tiklanadi. Mavjud mahalliy profil
+almashtirilmaydi; boshqa serverning farqli profili umumiy nusxani bosib
+yozolmaydi. Revision tekshiruvi parallel o‘zgarishlarni ham himoya qiladi.
+Loglar, chat bazalari va keshlar olinmaydi; nusxa chegarasi 8 MiB. Ishlayotgan
+Zoom profilidan yoki majburiy `SIGKILL`dan keyin nusxa olinmaydi. Xato bo‘lsa
+mahalliy profil saqlanadi, jurnalga ogohlantirish yoziladi. Bu davriy jonli
+sinxronlash emas: nusxa har bir Desktop yozuvi tugagach yangilanadi.
+**Profil tiklangani login tasdiqlandi degani emas**: boshqa serverda Zoom
+qayta kirishni talab qilishi mumkin. MongoDB’dagi brauzer cookie’lari Native
+login hisoblanmaydi. Login yoki
 qo‘shimcha ruxsat kerak bo‘lsa faqat `OWNER_TELEGRAM_ID` egasiga 15 daqiqalik
 boshqaruv havolasi yuboriladi. Desktop bir server foydalanuvchisida bir vaqtda
 bitta yozuvga xizmat qiladi; boshqa ochiq Zoom nusxasiga ulanmaydi.

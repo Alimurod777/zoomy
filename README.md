@@ -95,8 +95,17 @@ from visible meeting controls, and an open app alone does not start recording.
 Desktop login is separate from MongoDB browser cookies. After successful
 account sign-in, Zoom maintains its local profile (`~/.zoom/data` and
 `~/.config/zoomus.conf`); enable Keep me signed in if offered. The recorder
-does not delete that profile or sign the account out. Native session migration
-and MongoDB synchronization are not implemented. The temporary login/control page includes Backspace, Select all, and Clear
+does not delete that profile or sign the account out. With MongoDB configured,
+`ZOOM_DESKTOP_SYNC=true` (default) encrypts a bounded native profile snapshot
+after Zoom closes gracefully. Before opening Zoom, an empty local profile is
+restored from the separate `desktop_auth` collection using the existing
+`MONGODB_AUTH_KEY` and `ZOOM_AUTH_ID`. Existing local profiles are preserved;
+divergent profiles from another server cannot overwrite the shared snapshot.
+Revision checks prevent simultaneous uploads from overwriting newer snapshots.
+Snapshots include core Zoom databases and Zoom config files, exclude logs,
+chat databases and caches, and are limited to 8 MiB. No live-profile copying or
+backup after a forced kill is attempted. A restored profile is **not a verified
+login**: Zoom may require sign-in again on another device. The temporary login/control page includes Backspace, Select all, and Clear
 selected Zoom field buttons. Focus the remote input first. The Replace previous
 text checkbox switches between replacement and appending. Browser edits verify
 that an editable field has focus; native edits send fixed keyboard actions to
