@@ -1563,16 +1563,21 @@ class ZoomRecorder:
         if self._stop_event.is_set():
             return
         if self.use_profile_name:
-            state = await auth_store.load() if auth_store.configured else _load_zoom_state()
-            if isinstance(state, str):
-                state = json.loads(Path(state).read_text())
-            if isinstance(state, dict):
-                self.guest_name = state.get("profile", {}).get("display_name") or self.guest_name
+            try:
+                state = await auth_store.load() if auth_store.configured else _load_zoom_state()
+                if isinstance(state, str):
+                    state = json.loads(Path(state).read_text())
+                if isinstance(state, dict):
+                    self.guest_name = state.get("profile", {}).get("display_name") or self.guest_name
+            except Exception as exc:
+                # Browser auth is only an optional display-name source here.
+                # Guest admission through the native app must not depend on it.
+                logger.warning('Browser profile name unavailable (%s); native join uses configured guest name', type(exc).__name__)
         native = NativeZoom(self.display, self.sink_name, self._stop_event)
         try:
             await native.open(url, self.guest_name)
             if self.on_waiting:
-                await self.on_waiting("Haqiqiy Zoom Desktop orqali kiryapman. Brauzer logini Desktop loginidan alohida.")
+                await self.on_waiting("Zoom Desktop orqali kiryapman. Mehmon sifatida kirish ochiq bo‘lsa login talab qilinmaydi.")
             deadline = time.monotonic() + max(30, int(os.getenv("ZOOM_HOST_WAIT_SECONDS") or "7200"))
             link_sent = False
             recovery_since = None
@@ -1627,14 +1632,14 @@ class ZoomRecorder:
                         await asyncio.to_thread(self.request_pause)
                         paused_for_connection = True
                     await self._notice_admission(state)
-                    if not link_sent and time.monotonic() - unknown_since >= 15:
+                    if state in {'connecting', 'auth_required'} and not link_sent and time.monotonic() - unknown_since >= 15:
                         # The native app contains the owner's account, so only
                         # its owner receives an interactive desktop link.
                         owner = os.getenv("OWNER_TELEGRAM_ID", "")
                         if owner and str(self.user_id) == owner and self.on_waiting:
                             try:
                                 link = await native.control_link()
-                                await self.on_waiting("Desktop’da login yoki kirishni yakunlash uchun (15 daqiqa): " + link)
+                                await self.on_waiting("Desktop kirish oynasini boshqarish uchun (15 daqiqa; Zoom talab qilsagina login qiling): " + link)
                             except Exception:
                                 await self.on_waiting("Desktop boshqaruv havolasi ochilmadi. setup-login-link.sh sozlamalarini tekshiring.")
                         link_sent = True

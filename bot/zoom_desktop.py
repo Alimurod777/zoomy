@@ -64,8 +64,8 @@ def native_state(lines, meeting_window=False, previously_admitted=False):
     controls = 'participants' in lower and ('leave' in lower or 'share' in lower)
     if controls or (previously_admitted and meeting_window):
         return 'admitted'
-    if 'sign in' in lower and ('join' in lower or 'account' in lower):
-        return 'auth_required'
+    # Home offers both Join and Sign in; that is not an authentication demand.
+    # Explicit meeting authentication requirements are handled by the classifier.
     return 'connecting'
 
 

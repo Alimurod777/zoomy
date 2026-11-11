@@ -30,7 +30,8 @@ class DesktopStateTests(unittest.TestCase):
                 native_join_uri(url, 'Zoomy')
 
     def test_home_and_preview_are_never_admission(self):
-        self.assertEqual(native_state([('Join a meeting Sign in', 0, 0)]), 'auth_required')
+        self.assertEqual(native_state([('Join a meeting Sign in', 0, 0)]), 'connecting')
+        self.assertEqual(native_state([('Sign in to join this meeting', 0, 0)]), 'auth_required')
         self.assertEqual(native_state([('Video Preview Join', 0, 0)]), 'connecting')
         self.assertEqual(native_state([], meeting_window=True), 'connecting')
 
@@ -188,6 +189,35 @@ class DesktopFlowTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(recorder_module,'time',SimpleNamespace(monotonic=lambda:clock.now)):
                 await rec._record_native(URL)
             self.assertEqual(native.control_link.await_count,expected)
+
+    async def test_guest_desktop_records_when_browser_auth_store_is_unavailable(self):
+        rec=ZoomRecorder(use_profile_name=True, on_started=AsyncMock())
+        native=Mock(open=AsyncMock(),close=AsyncMock(),prepare=AsyncMock(),clean_shared_view=AsyncMock(),
+            snapshot=AsyncMock(side_effect=['admitted','ended']))
+        rec._start_ffmpeg=Mock(return_value=Mock(poll=Mock(return_value=None)))
+        rec._stop_ffmpeg=Mock()
+        rec._wait_or_stop=AsyncMock(return_value=False)
+        broken_store=SimpleNamespace(configured=True,load=AsyncMock(side_effect=RuntimeError('private-uri')))
+        with tempfile.TemporaryDirectory() as folder, patch.object(recorder_module,'RECORDINGS_DIR',Path(folder)), \
+                patch('zoom_desktop.NativeZoom',return_value=native), patch('recorder.auth_store',broken_store):
+            await rec._record_native(URL)
+        rec.on_started.assert_awaited_once()
+        native.open.assert_awaited_once_with(URL,rec.guest_name)
+        native.control_link.assert_not_called()
+
+    async def test_host_and_waiting_room_never_prompt_for_login(self):
+        rec=ZoomRecorder(user_id=999,use_profile_name=False,on_waiting=AsyncMock())
+        clock=SimpleNamespace(now=0)
+        async def delay(seconds):
+            clock.now+=20
+            return False
+        rec._wait_or_stop=AsyncMock(side_effect=delay)
+        native=Mock(open=AsyncMock(),close=AsyncMock(),control_link=AsyncMock(),
+            snapshot=AsyncMock(side_effect=['waiting_host','waiting_host','waiting_room','waiting_room','ended']))
+        with patch.dict(os.environ,OWNER_TELEGRAM_ID='999'), patch('zoom_desktop.NativeZoom',return_value=native), \
+                patch.object(recorder_module,'time',SimpleNamespace(monotonic=lambda:clock.now)):
+            await rec._record_native(URL)
+        native.control_link.assert_not_awaited()
 
     async def test_native_cancel_does_not_open_an_app(self):
         rec=ZoomRecorder()

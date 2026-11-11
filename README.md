@@ -92,7 +92,12 @@ prevent fallback or `desktop` to force the native client when a browser cannot
 identify the restriction. Native support is experimental: admission is checked
 from visible meeting controls, and an open app alone does not start recording.
 
-Desktop login is separate from MongoDB browser cookies. After successful
+Desktop login is separate from MongoDB browser cookies.
+Guest-enabled app-only meetings do not require account sign-in: the native
+invitation opens directly and recording starts after admission. A Home screen
+offering Sign in is not treated as a meeting authentication requirement.
+Waiting for the host or admission does not trigger an interactive login link.
+After successful
 account sign-in, Zoom maintains its local profile (`~/.zoom/data` and
 `~/.config/zoomus.conf`); enable Keep me signed in if offered. The recorder
 does not delete that profile or sign the account out. With MongoDB configured,

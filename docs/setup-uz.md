@@ -75,6 +75,10 @@ mumkin; brauzer uchun belgilangan 25 soniyalik urinish chegarasi unga tatbiq
 qilinmaydi.
 
 Desktop logini brauzer cookie’laridan alohida. Akkauntga muvaffaqiyatli
+kirish barcha uchrashuvlar uchun shart emas: mehmonlarga ochiq taklif Desktop
+orqali login qilmasdan ishlaydi. Home oynasidagi oddiy **Sign in** tugmasi
+akkaunt talab qilinganini bildirmaydi; host yoki qabulni kutayotganda login
+havolasi yuborilmaydi. Akkauntga muvaffaqiyatli
 kirgach, Zoom o‘zining mahalliy profilida (`~/.zoom/data`, sozlamalari
 `~/.config/zoomus.conf`) autentifikatsiya holatini saqlaydi. Login oynasida
 **Keep me signed in** varianti bo‘lsa uni belgilang. Bot bu kataloglarni har
