@@ -119,10 +119,18 @@ nusxasini ochmang. SIGHUP restart signali yozuvlarni yakunlashga va Whisper
 ishchisini to‘xtatishga yo‘naltiriladi. Rasmiy ko‘rsatma:
 https://help.alwaysdata.com/en/docs/web-hosting/services/
 
-Services ishlatilmasa, doimiy jarayonlarga ruxsat berilgan boshqa server kerak.
-Webhook faqat Telegram transportini almashtiradi; Zoom/FFmpeg yozuvi uchun
-uzluksiz jarayon zarurligicha qoladi. Ushbu hujjat Services’ni avtomatik
-sozlamaydi. Resurslarni kamaytirish hosting limitlariga sig‘ishni kafolatlamaydi.
+Servicesiz boshqa ruxsat etilgan serverdan yoki Web → Sites → User program
+orqali webhook arxitekturasidan foydalanish mumkin. Hozirgi kod polling
+rejimida; webhook transporti hali qo‘shilmagan. Sayt variantida Idle time `0`
+bo‘lishi kerak, biroq platforma sayt jarayonining uzluksiz ishlashini
+kafolatlamaydi: https://help.alwaysdata.com/en/docs/web-hosting/sites/misc/
+Zoom/FFmpeg uchun yozuv davomida uzluksiz jarayon zarur. Resurslarni kamaytirish
+hosting limitlariga sig‘ishni kafolatlamaydi.
+
+Terminaldagi `/stop` va **Yes, Stop** faqat tanlangan yozuvni yakunlaydi;
+bot keyingi buyruqlarni kutishda davom etadi. Botni to‘liq yopish — `Ctrl+C`.
+Terminal ochiq turishi tashqi SIGKILL’dan himoya qilmaydi. Shell’dagi `Killed`
+odatiy `/stop` natijasi emas; aniq sabab uchun server loglari kerak.
 
 Yengil standart sozlamalar: bitta yozuv, `RECORD_FPS=15`, `FFMPEG_THREADS=2`,
 `WHISPER_THREADS=2`, `WHISPER_MODEL=small`, `AUTO_TRANSCRIBE=false`.
