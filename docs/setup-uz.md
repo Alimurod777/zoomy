@@ -250,6 +250,19 @@ uni o‘z katalogidan ishga tushiradi. PulseAudio loyiha konfiguratsiyasi va
 
 ## `.env` ni to‘ldirish
 
+`scripts/run.sh` orqali ishga tushirganda ko‘chirishga qulay yo‘llar ishlating:
+
+```env
+RECORDINGS_DIR=recordings
+ZOOM_STATE_PATH=secrets/zoom_state.json
+YOUTUBE_TOKEN_PATH=secrets/youtube_token.json
+```
+
+Launcher nisbiy yo‘llarni loyiha ildiziga nisbatan hisoblaydi, service working
+directory qiymatiga bog‘liq emas. Maxsus absolut yo‘llar ham saqlanadi.
+Yangi serverga ko‘chirganda Python va media runtime dependencylari ham o‘rnatilgan
+bo‘lishi kerak; bu sozlama ularni avtomatik o‘rnatmaydi.
+
 Mahalliy yo‘llar bilan maxfiy `.env` namunasi tayyor. `scripts/run.sh`
 faylni `python-dotenv` bilan o‘qiydi, shuning uchun MongoDB URI ichidagi `&`
 belgisi ham to‘liq saqlanadi. `.env` ni shell’da `source` qilish shart emas.

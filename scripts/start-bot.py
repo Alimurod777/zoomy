@@ -11,6 +11,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def load_configuration(path):
     load_dotenv(path, override=True)
+    # Resolve configured relative paths against the project, regardless of CWD.
+    for name in ('RECORDINGS_DIR', 'ZOOM_STATE_PATH', 'YOUTUBE_TOKEN_PATH'):
+        value = os.getenv(name)
+        if value:
+            location = Path(value).expanduser()
+            if not location.is_absolute():
+                location = ROOT / location
+            os.environ[name] = str(location.resolve())
     for name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
         os.environ.setdefault(name, '2')
     if os.getenv('TELEGRAM_TOKEN', '') in ('', 'your_bot_token_here'):

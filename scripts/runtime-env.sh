@@ -6,8 +6,12 @@ export PATH="$ZOOMY_ROOT/.runtime/bin:$ZOOMY_ROOT/.runtime/root/usr/bin:$ZOOMY_R
 export LD_LIBRARY_PATH="$ZOOMY_ROOT/.runtime/root/usr/lib/x86_64-linux-gnu:$ZOOMY_ROOT/.runtime/root/usr/lib/x86_64-linux-gnu/pulseaudio:$ZOOMY_ROOT/.runtime/root/usr/lib/pulse-16.1+dfsg1/modules${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PULSE_RUNTIME_PATH="/tmp/zoomy-$(id -u)/pulse"
 export PULSE_SERVER="unix:$PULSE_RUNTIME_PATH/native"
-export PULSE_CLIENTCONFIG="$ZOOMY_ROOT/.runtime/pulse-client.conf"
-export XKB_CONFIG_ROOT="$ZOOMY_ROOT/.runtime/root/usr/share/X11/xkb"
+if [[ -f "$ZOOMY_ROOT/.runtime/pulse-client.conf" ]]; then
+    export PULSE_CLIENTCONFIG="$ZOOMY_ROOT/.runtime/pulse-client.conf"
+fi
+if [[ -d "$ZOOMY_ROOT/.runtime/root/usr/share/X11/xkb" ]]; then
+    export XKB_CONFIG_ROOT="$ZOOMY_ROOT/.runtime/root/usr/share/X11/xkb"
+fi
 export TMPDIR=/tmp
 mkdir -p "$PULSE_RUNTIME_PATH"
 chmod 700 "/tmp/zoomy-$(id -u)" "$PULSE_RUNTIME_PATH"

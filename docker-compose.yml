@@ -15,6 +15,10 @@ services:
     # shutdown; keep it above SHUTDOWN_GRACE_SECS (default 75) in bot.py.
     stop_grace_period: 90s
     env_file: .env
+    environment:
+      RECORDINGS_DIR: /recordings
+      ZOOM_STATE_PATH: /secrets/zoom_state.json
+      YOUTUBE_TOKEN_PATH: /secrets/youtube_token.json
     depends_on:
       - cli-proxy-api
     volumes:
