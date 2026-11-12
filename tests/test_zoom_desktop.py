@@ -371,7 +371,11 @@ class DesktopFlowTests(unittest.IsolatedAsyncioTestCase):
                 snapshot=AsyncMock(side_effect=['auth_required','auth_required','ended']))
             with patch.dict(os.environ,OWNER_TELEGRAM_ID='999'), patch('zoom_desktop.NativeZoom',return_value=native), \
                     patch.object(recorder_module,'time',SimpleNamespace(monotonic=lambda:clock.now)):
-                await rec._record_native(URL)
+                if user==7:
+                    with self.assertRaisesRegex(recorder_module.MeetingJoinError,'login kerak'):
+                        await rec._record_native(URL)
+                else:
+                    await rec._record_native(URL)
             self.assertEqual(native.control_link.await_count,expected)
 
     async def test_guest_desktop_records_when_browser_auth_store_is_unavailable(self):

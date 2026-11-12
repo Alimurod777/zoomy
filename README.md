@@ -152,6 +152,30 @@ visible in Zoom's participant list.
 
 Set `AUTO_RECORD_SETUP=false` for the manual name and scheduling flow below.
 
+Choose the next recording route with `/zoommode auto`, `web-guest`, `web-auth`,
+`app-guest`, or `app-auth`. The preference is saved per Telegram user and does
+not change a live recording. `auto` starts without browser cookies, retries
+saved web auth only when required, and switches to native when the invitation
+requires it. Native guest mode uses a fresh private HOME with Mongo sync
+disabled; an account requirement can trigger one native account attempt.
+`app-auth` verifies the app Home account before joining; it never quietly
+substitutes a guest session. Legacy `web` and `desktop` settings remain valid.
+
+Owner/private chat: `/zoomapplogin` opens a standalone native login link,
+`/zoomappdone` verifies Home/profile account controls and closes/saves,
+`/zoomappstatus` checks the active window, `/zoomappcancel` (or `/cancel`)
+cancels without replacing the shared Mongo snapshot. Use `/zoomlogin` for web
+auth. Passwords and MFA codes are entered directly into the private desktop.
+Desktop login startup is bounded to 60 seconds and the flow expires after
+15 minutes. In-meeting auth waits are capped by `ZOOM_RECORD_AUTH_TIMEOUT=120`;
+recording app startup is capped at 45 seconds, unknown native join screens
+time out after 60 seconds, and `/stop` interrupts
+pending native checks. CAPTCHA, SSO and MFA still require the account owner.
+UI verification and a saved profile do not guarantee a future meeting will
+accept that account, domain, device or expired session. Only the owner receives
+interactive access to the shared account profile; other authorized users get
+instructions rather than waiting indefinitely for a private login link.
+
 1. **URL or Meeting ID** — pass inline or send after the prompt (100s timeout → cancelled)
    - Full URL with password: `https://zoom.us/j/97856007427?pwd=xxx`
    - URL without password: `https://zoom.us/j/97856007427`

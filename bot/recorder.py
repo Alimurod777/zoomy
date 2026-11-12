@@ -18,6 +18,7 @@ from playwright.async_api import async_playwright, Page
 from auth_store import auth_store
 from meeting_state import classify_meeting, SNAPSHOT_JS
 from zoom_profile import profile_name_from_page
+from join_modes import mode_for
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,14 @@ class MeetingJoinError(RuntimeError):
 
 class DesktopRequired(MeetingJoinError):
     pass
+
+class WebAuthRequired(MeetingJoinError):
+    pass
+
+class NativeAuthRequired(MeetingJoinError):
+    pass
+
+_NATIVE_STOPPED = object()
 
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "/recordings"))
 GUEST_NAME = os.environ.get("GUEST_NAME", "zoomy.ircham.dev")
@@ -488,6 +497,9 @@ class ZoomRecorder:
         self.sink_name = sink[: -len(".monitor")] if sink.endswith(".monitor") else sink
         self.guest_name = guest_name
         self.use_profile_name = use_profile_name
+        self._join_mode = None
+        self._native_guest = False
+        self._native_require_auth = False
         self._admission_notice = None
         self._reconnect_count = 0
         self.recording_prefix = recording_prefix
@@ -590,12 +602,11 @@ class ZoomRecorder:
         self._started_at = datetime.now()
 
         try:
-            mode = (os.getenv("ZOOM_JOIN_MODE") or "auto").strip().lower()
-            if mode not in {"auto", "web", "desktop"}:
-                raise ValueError("ZOOM_JOIN_MODE must be auto, web or desktop")
-            if mode == "desktop":
+            mode = self._join_mode = mode_for(self.user_id)
+            logger.info('Zoom join policy: %s',mode)
+            if mode in {'desktop','app-guest','app-auth'}:
                 logger.info("Joining directly with native Zoom Desktop (display=%s)", self.display)
-                await self._record_native(url)
+                await self._record_desktop(url)
                 return
             web_url = build_web_client_url(url)
 
@@ -638,26 +649,8 @@ class ZoomRecorder:
                 # so an absent session file simply means the old guest join.
                 # MongoDB is authoritative when configured. Read just before
                 # joining so other servers' new browser logins are picked up.
-                zoom_state = await auth_store.load() if auth_store.configured else _load_zoom_state()
-                self._signed_in = zoom_state is not None
-                if isinstance(zoom_state, str):
-                    zoom_state = json.loads(Path(zoom_state).read_text())
-                if self._signed_in and self.use_profile_name and isinstance(zoom_state, dict):
-                    self.guest_name = zoom_state.get("profile", {}).get("display_name") or self.guest_name
-                ctx = await browser.new_context(
-                    no_viewport=True,
-                    permissions=["microphone", "camera"],
-                    storage_state=({k: v for k, v in zoom_state.items() if k in ("cookies", "origins")}
-                                   if isinstance(zoom_state, dict) else zoom_state),
-                    locale="en-US",
-                )
-                page = await ctx.new_page()
-                await self._monitor_desktop_handoff(page)
-                resume_current_page = False
-                if mode == 'auto':
-                    web_url, resume_current_page = await self._choose_join_target(page, url, web_url)
-                logger.info("Joining Web App %s (display=%s)", log_zoom_url(web_url), self.display)
-                if not await self._join_meeting(page, web_url, resume_waiting_room=resume_current_page):
+                page = await self._enter_web(browser,url,web_url,mode)
+                if page is None:
                     return
                 await self._prepare_recording_view(page)
                 # Measure browser chrome height for cropping
@@ -728,7 +721,7 @@ class ZoomRecorder:
             # and sink. No simultaneous duplicate participant/audio capture.
             try:
                 logger.info("Switching to native Zoom Desktop (display=%s)", self.display)
-                await self._record_native(url)
+                await self._record_desktop(url)
             except Exception as exc:
                 self._session_errored = self._session_errored or self.output_path is None
                 if self.on_error:
@@ -1566,15 +1559,70 @@ class ZoomRecorder:
         }[state]
 
     def _join_exception(self, state):
-        if state in {"app_required", "app_launch"} and (os.getenv("ZOOM_JOIN_MODE") or "auto").lower() == "auto":
+        mode = self._join_mode or mode_for(self.user_id)
+        if state in {"app_required", "app_launch"} and mode == "auto":
             return DesktopRequired("Zoom desktop ilovasi talab qilindi")
+        if state=='auth_required' and mode=='auto':
+            return DesktopRequired('Web login qabul qilinmadi; Desktop tekshiriladi') if getattr(self,'_signed_in',False) else WebAuthRequired('Web login kerak')
+        if state=='auth_required' and mode=='web-guest':
+            return MeetingJoinError('Konferensiya akkaunt talab qiladi. /zoomlogin va /zoommode web-auth yuboring.')
         return MeetingJoinError(self._join_error(state))
+
+    async def _enter_web(self,browser,invitation,web_url,mode):
+        zoom_state=None
+        if mode in {'web','web-auth'}:
+            zoom_state=await auth_store.load() if auth_store.configured else _load_zoom_state()
+            if mode=='web-auth' and zoom_state is None:
+                raise MeetingJoinError('Web login yo‘q. /zoomlogin, keyin /zoommode web-auth yuboring.')
+        for attempt in range(2):
+            if isinstance(zoom_state,str):
+                zoom_state=json.loads(Path(zoom_state).read_text())
+            self._signed_in=zoom_state is not None
+            logger.info('Web join route: %s','account' if self._signed_in else 'guest')
+            if self._signed_in and self.use_profile_name and isinstance(zoom_state,dict):
+                self.guest_name=zoom_state.get('profile',{}).get('display_name') or self.guest_name
+            ctx=await browser.new_context(no_viewport=True,permissions=['microphone','camera'],locale='en-US',
+                storage_state=({k:v for k,v in zoom_state.items() if k in {'cookies','origins'}}
+                               if isinstance(zoom_state,dict) else zoom_state))
+            page=await ctx.new_page()
+            await self._monitor_desktop_handoff(page)
+            try:
+                target,resume=(await self._choose_join_target(page,invitation,web_url)
+                               if mode=='auto' else (web_url,False))
+                if await self._join_meeting(page,target,resume_waiting_room=resume):
+                    return page
+                return None
+            except WebAuthRequired:
+                await ctx.close()
+                if attempt or mode!='auto':
+                    raise
+                try:
+                    zoom_state=await auth_store.load() if auth_store.configured else _load_zoom_state()
+                except Exception as exc:
+                    logger.warning('Web auth unavailable (%s); trying native route',type(exc).__name__)
+                    raise DesktopRequired('Web auth tayyor emas; Desktop tekshiriladi') from None
+                if zoom_state is None:
+                    raise DesktopRequired('Web auth yo‘q; Desktop tekshiriladi')
+        raise MeetingJoinError('Zoom kirish usullari tugadi; loginni tekshiring.')
+
+    async def _record_desktop(self,url):
+        mode=self._join_mode or mode_for(self.user_id)
+        self._native_guest=mode in {'auto','app-guest'}
+        self._native_require_auth=mode=='app-auth'
+        try:
+            await self._record_native(url)
+        except NativeAuthRequired:
+            if mode!='auto':
+                raise MeetingJoinError('Desktop akkaunt talab qiladi. /zoomapplogin va /zoommode app-auth yuboring.') from None
+            self._native_guest=False
+            self._native_require_auth=True
+            await self._record_native(url)
 
     async def _record_native(self, url):
         from zoom_desktop import NativeZoom
         if self._stop_event.is_set():
             return
-        if self.use_profile_name:
+        if self.use_profile_name and not self._native_guest:
             try:
                 state = await auth_store.load() if auth_store.configured else _load_zoom_state()
                 if isinstance(state, str):
@@ -1585,9 +1633,16 @@ class ZoomRecorder:
                 # Browser auth is only an optional display-name source here.
                 # Guest admission through the native app must not depend on it.
                 logger.warning('Browser profile name unavailable (%s); native join uses configured guest name', type(exc).__name__)
-        native = NativeZoom(self.display, self.sink_name, self._stop_event)
+        native = (NativeZoom(self.display,self.sink_name,self._stop_event,guest=True) if self._native_guest
+                  else NativeZoom(self.display, self.sink_name, self._stop_event))
         try:
-            await native.open(url, self.guest_name)
+            opening=(native.open(url,self.guest_name,require_auth=True) if self._native_require_auth
+                     else native.open(url,self.guest_name))
+            try:
+                if await self._native_operation(opening,45) is _NATIVE_STOPPED:
+                    return
+            except asyncio.TimeoutError:
+                raise MeetingJoinError('Desktop 45 soniyada ochilmadi. /zoomapplogin bilan loginni tekshiring.') from None
             if self.on_waiting:
                 await self.on_waiting("Zoom Desktop orqali kiryapman. Mehmon sifatida kirish ochiq bo‘lsa login talab qilinmaydi.")
             deadline = time.monotonic() + max(30, int(os.getenv("ZOOM_HOST_WAIT_SECONDS") or "7200"))
@@ -1595,13 +1650,26 @@ class ZoomRecorder:
             recovery_since = None
             paused_for_connection = False
             unknown_since = time.monotonic()
+            auth_since = None
             while not self._stop_event.is_set():
-                try:
-                    state = await asyncio.wait_for(native.snapshot(), timeout=25)
-                except (asyncio.TimeoutError, OSError):
-                    state = "disconnected"
+                state = await self._native_snapshot(native)
+                if state is None:
+                    break
                 if self._stop_event.is_set():
                     break
+                if state=='auth_required':
+                    if self._native_guest:
+                        raise NativeAuthRequired('Desktop akkaunt talab qildi')
+                    if auth_since is None:
+                        auth_since=time.monotonic()
+                    if str(self.user_id)!=os.getenv('OWNER_TELEGRAM_ID',''):
+                        raise MeetingJoinError('Desktop login kerak. Bot egasi /zoomapplogin orqali kirib, /zoomappdone yuborsin.')
+                if state in {'admitted','waiting_host','waiting_room'}:
+                    auth_since=None
+                    unknown_since=time.monotonic()
+                auth_limit=max(30,min(900,int(os.getenv('ZOOM_RECORD_AUTH_TIMEOUT') or '120')))
+                if auth_since is not None and time.monotonic()-auth_since>=auth_limit:
+                    raise MeetingJoinError('Desktop login kutish vaqti tugadi. /zoomapplogin orqali login qilib, /record ni qaytaring.')
                 if state in {"ended", "removed", "invalid", "passcode", "app_required"}:
                     self._auto_ended = state == "ended"
                     if state != "ended" and self.on_error:
@@ -1650,10 +1718,12 @@ class ZoomRecorder:
                         owner = os.getenv("OWNER_TELEGRAM_ID", "")
                         if owner and str(self.user_id) == owner and self.on_waiting:
                             try:
-                                link = await native.control_link()
+                                link = await asyncio.wait_for(native.control_link(),20)
                                 await self.on_waiting("Desktop kirish oynasini boshqarish uchun (15 daqiqa; Zoom talab qilsagina login qiling): " + link)
                             except Exception:
                                 await self.on_waiting("Desktop boshqaruv havolasi ochilmadi. setup-login-link.sh sozlamalarini tekshiring.")
+                                if auth_since is not None:
+                                    raise MeetingJoinError('Desktop login havolasi ochilmadi. /zoomapplogin orqali alohida kiring.') from None
                         link_sent = True
                     if self.output_path or state == "disconnected":
                         recovery_since = recovery_since or time.monotonic()
@@ -1663,20 +1733,43 @@ class ZoomRecorder:
                             if self.on_error:
                                 await self.on_error("Desktop ulanishi 30 soniyada tiklanmadi. Yozilgan qism saqlandi.")
                             break
-                    elif state == "connecting" and time.monotonic() - unknown_since >= 900:
-                        raise RuntimeError("Desktop’da kirish tasdiqlanmadi. Login yoki taklif havolasini tekshiring.")
+                    elif state == 'connecting' and auth_since is None and time.monotonic()-unknown_since>=60:
+                        raise MeetingJoinError('Desktop kirish oynasi 60 soniyada tayyor bo‘lmadi. /zoomapplogin yoki taklif havolasini tekshiring.')
                 if self.output_path is None and time.monotonic() >= deadline:
                     raise RuntimeError("Desktop’da hostni kutish muddati tugadi.")
                 if await self._wait_or_stop(2):
                     break
         finally:
             # Finalize video before any leave/login UI can enter the recording.
-            self._native_shared_seen = getattr(native, 'share_seen', False) is True
+            self._native_shared_seen = self._native_shared_seen or getattr(native, 'share_seen', False) is True
             reference = getattr(native, 'terminal_reference', None)
             if isinstance(reference,tuple) and len(reference)==2 and isinstance(reference[0],bytes):
                 self._native_terminal_reference = reference
             await asyncio.to_thread(self._stop_ffmpeg)
             await native.close()
+
+    async def _native_snapshot(self,native):
+        try:
+            result=await self._native_operation(native.snapshot(),25)
+            return None if result is _NATIVE_STOPPED else result
+        except (asyncio.TimeoutError,OSError):
+            return 'disconnected'
+
+    async def _native_operation(self,awaitable,timeout):
+        operation=asyncio.create_task(awaitable)
+        stopping=asyncio.create_task(self._stop_event.wait())
+        try:
+            done,_=await asyncio.wait((operation,stopping),timeout=timeout,return_when=asyncio.FIRST_COMPLETED)
+            if stopping in done:
+                return _NATIVE_STOPPED
+            if operation not in done:
+                raise asyncio.TimeoutError()
+            return await operation
+        finally:
+            for task in (operation,stopping):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(operation,stopping,return_exceptions=True)
 
     async def _clean_native_video(self):
         """Keep full raw capture until a low-priority cleanup worker succeeds."""

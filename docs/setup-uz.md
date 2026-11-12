@@ -318,6 +318,37 @@ quyidagi noVNC usulidan foydalaning. Login tasdiqlanmasdan sessiya saqlanmaydi.
 
 ## MongoDB va sinxronlash
 
+### Kirish usulini tanlash va Desktop login
+
+`/zoommode auto` — avval web mehmon; akkaunt talab qilinsa saqlangan web auth;
+ilova kerak bo‘lsa Desktop mehmon, akkaunt talab qilinsa Desktop auth sinovi.
+App-only havolada qo‘llab-quvvatlanmaydigan web bosqichlari tashlab o‘tiladi.
+Qo‘lda tanlash: `/zoommode web-guest`, `/zoommode web-auth`,
+`/zoommode app-guest`, `/zoommode app-auth`. Tanlov har bir Telegram user uchun
+alohida saqlanadi, amaldagi yozuvni o‘zgartirmaydi. `app-guest` vaqtinchalik
+alohida HOME’da ishlaydi va MongoDB akkaunt profilini ishlatmaydi. `app-auth`
+Home oynasida akkauntni tekshiradi; login tayyor bo‘lmasa mehmon bo‘lib kirmaydi.
+
+Desktop’ga oldindan kirish, faqat bot egasining shaxsiy chatida:
+
+1. `/zoomapplogin` — vaqtinchalik boshqaruv havolasini oching, Zoom ichida
+   email/parol/2FA’ni o‘zingiz kiriting. Bu ma’lumotlarni Telegram’ga yubormang.
+2. Akkaunt Home oynasi ochilgach `/zoomappdone`. Tekshiruv o‘tmasa profil
+   menyusini ochib **Sign out** ko‘rinadigan qiling va komandani qaytaring.
+3. `/zoommode app-auth`, keyin `/record HAVOLA`.
+
+`/zoomappstatus` — ochiq login oynasini tekshirish; `/zoomappcancel` yoki
+`/cancel` — yopish (umumiy Mongo nusxasi almashtirilmaydi). Web login uchun
+`/zoomlogin` avvalgidek ishlaydi. Profil nusxasi Mongo’da saqlansa ham Zoom
+keyinchalik qayta kirish, SSO, CAPTCHA yoki yangi MFA talab qilishi mumkin.
+
+Qotib qolmaslik chegaralari: login oynasini ochish 60 soniya, yozuv uchun
+ilovani ochish 45 soniya, alohida login
+jarayoni 15 daqiqa, yozuvdagi auth kutish `ZOOM_RECORD_AUTH_TIMEOUT=120` soniya,
+noma’lum Desktop kirish oynasi 60 soniya. Host/waiting-room kutish alohida.
+`/stop` Desktop tekshiruvini kutib qolmaydi. Boshqa user akkaunt loginiga
+kira olmaydi; u bot egasiga login qilish kerakligi haqida xabar oladi.
+
 Ushbu serverda MongoDB 8.0.30 root huquqisiz o‘rnatildi, parolli ulanish
 `127.0.0.1:27018` da tayyor. `.env` dagi URI va shifrlash kaliti yaratilgan.
 `scripts/run.sh` mahalliy bazani kerak bo‘lsa ishga tushiradi.

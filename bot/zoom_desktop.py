@@ -11,6 +11,7 @@ import re
 import shutil
 import signal
 import time
+import tempfile
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 from meeting_state import classify_meeting
@@ -211,7 +212,7 @@ class NativeDesktopLink(BrowserLoginLink):
 
 
 class NativeZoom:
-    def __init__(self, display, sink, stop_event):
+    def __init__(self, display, sink, stop_event, guest=False):
         self.display = display
         self.display_num = int(display.lstrip(':').split('.')[0])
         self.sink = sink
@@ -229,6 +230,15 @@ class NativeZoom:
         self._share_panel_hidden = False
         self._last_view_attempt = float('-inf')
         self.auth_store = DesktopAuthStore()
+        self.guest = guest
+        self.guest_home = None
+        self.last_backup = 'not-saved'
+        if guest:
+            class GuestStore(DesktopAuthStore):
+                @property
+                def configured(self):
+                    return False
+            self.auth_store = GuestStore()
         self.profile_sync = 'disabled'
         self.share_seen = False
         self.audio_dialog_open = False
@@ -257,7 +267,7 @@ class NativeZoom:
                 proc.kill()
                 await proc.wait()
 
-    async def open(self, url, name):
+    async def open(self, url=None, name='', require_auth=False):
         binary = ROOT / '.runtime/zoom/opt/zoom/ZoomLauncher'
         if not binary.is_file() or not all(shutil.which(p) for p in ('xdotool', 'tesseract', 'openbox')):
             raise RuntimeError('Desktop tayyor emas. bash scripts/setup-zoom-desktop.sh ni bajaring.')
@@ -273,6 +283,11 @@ class NativeZoom:
             self.lock_file.close()
             self.lock_file = None
             raise RuntimeError('Zoom Desktop boshqa yozuvda band. U tugagach qayta urinib ko‘ring.') from None
+        if self.guest:
+            self.guest_home = tempfile.TemporaryDirectory(prefix='zoom-guest-',dir=ROOT/'.runtime')
+            home = self.guest_home.name
+            self.env.update(HOME=home,XDG_CONFIG_HOME=home+'/.config',XDG_DATA_HOME=home+'/.local/share',
+                            XDG_CACHE_HOME=home+'/.cache',XDG_STATE_HOME=home+'/.local/state')
         try:
             outcome = await self.auth_store.prepare()
             self.profile_sync = outcome
@@ -296,15 +311,53 @@ class NativeZoom:
         self.log = os.fdopen(fd, 'w')
         self.wm = await asyncio.create_subprocess_exec('openbox', '--sm-disable', env=self.env,
                 stdout=self.log, stderr=self.log, start_new_session=True)
-        self.uri = native_join_uri(url, name)
-        self.process = await asyncio.create_subprocess_exec(str(binary), '--url='+self.uri,
+        self.uri = native_join_uri(url, name) if url else None
+        args = [str(binary)] + (['--url='+self.uri] if self.uri and not require_auth else [])
+        self.process = await asyncio.create_subprocess_exec(*args,
                 env=self.env, cwd=binary.parent, stdout=self.log, stderr=self.log, start_new_session=True)
+        if require_auth:
+            deadline=time.monotonic()+20
+            while time.monotonic()<deadline and not self.stop_event.is_set():
+                try:
+                    status=await asyncio.wait_for(self.login_status(),max(.1,deadline-time.monotonic()))
+                except asyncio.TimeoutError:
+                    break
+                if status=='signed-in':
+                    if self.uri:
+                        await self.command(str(binary),'--url='+self.uri,check=True)
+                    return
+                if status=='sign-in':
+                    break
+                await asyncio.sleep(.5)
+            raise RuntimeError('Desktop akkaunti tasdiqlanmadi. /zoomapplogin orqali kiring, /zoomappdone bilan saqlang.')
 
     async def control_link(self):
         if not self.link:
             self.link = NativeDesktopLink(self, ttl=900)
             await self.link.open()
         return self.link.url
+
+    async def login_status(self):
+        """Positive account controls on the standalone Home screen only."""
+        await self.read_screen()
+        if self._last_screen_png:
+            from PIL import Image
+            image=Image.open(io.BytesIO(self._last_screen_png))
+            image=image.resize((image.width*2,image.height*2))
+            buffer=io.BytesIO()
+            image.save(buffer,format='PNG')
+            data=await self.command('tesseract','stdin','stdout','-l','eng','--psm','11','tsv',
+                                    input=buffer.getvalue(),timeout=15)
+            labels=[label.casefold().strip() for label,_,_ in ocr_lines(data.decode(errors='replace'))]
+        else:
+            labels=[label.casefold().strip() for label,_,_ in self.lines]
+        if any(re.fullmatch(r'sign out|switch account',label) for label in labels):
+            return 'signed-in'
+        if any(re.fullmatch(r'sign in|sign in with.*',label) for label in labels):
+            return 'sign-in'
+        if any('new meeting' in label for label in labels) and any('schedule' in label for label in labels):
+            return 'signed-in'
+        return 'unknown'
 
     async def snapshot(self):
         if self.process and self.process.returncode is not None:
@@ -558,7 +611,7 @@ class NativeZoom:
         except asyncio.TimeoutError:
             pass
 
-    async def close(self):
+    async def close(self, save_profile=True):
         graceful = self.process is not None and self.process.returncode != -signal.SIGKILL
         if self.link:
             try:
@@ -578,11 +631,20 @@ class NativeZoom:
                             graceful = False
                         os.killpg(proc.pid, signal.SIGKILL)
                         await proc.wait()
+        # Zoom's CEF helpers can outlive the launcher and keep recreating cache
+        # files in a guest HOME. Reap only this instance's remaining group.
+        if self.process:
+            try:
+                os.killpg(self.process.pid,signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         try:
-            if graceful:
+            if graceful and save_profile:
                 outcome = await self.auth_store.backup()
+                self.last_backup = outcome
                 logger.info('Desktop profile backup: %s (account login not verified)', outcome)
         except Exception as exc:
+            self.last_backup = 'failed'
             logger.warning('Desktop profile backup failed: %s; local profile preserved',
                            str(exc) if isinstance(exc, AuthStoreError) else type(exc).__name__)
         finally:
@@ -594,3 +656,13 @@ class NativeZoom:
             self.log.close()
         if self.lock_file:
             self.lock_file.close()
+        if self.guest_home:
+            for _ in range(10):
+                try:
+                    self.guest_home.cleanup()
+                    break
+                except OSError:
+                    await asyncio.sleep(.2)
+            else:
+                logger.warning('Guest profile cleanup delayed; this profile will not be reused')
+            self.guest_home = None

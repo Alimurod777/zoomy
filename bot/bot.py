@@ -36,6 +36,8 @@ import youtube as youtube_mod
 import telegram_upload as telegram_upload_mod
 from auth_store import auth_store
 from zoom_auth_bot import zoom_auth_bot
+from zoom_app_auth import zoom_app_auth
+from join_modes import MODES, mode_for, set_mode
 
 from recorder import ZoomRecorder, _display_pool, SILENT_SNOOZE_SECS, BREAKOUT_AUTOJOIN_SECS, log_zoom_url
 from store import RecordingSession, SessionStore
@@ -528,6 +530,8 @@ def _session_label(s: RecordingSession) -> str:
 
 
 def _active_input_flow(user_id: int) -> str | None:
+    if zoom_app_auth.active(user_id):
+        return 'Zoom Desktop login'
     if zoom_auth_bot.active(user_id):
         return "Zoom login"
     if store.has_pending(user_id):
@@ -605,6 +609,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """Cancel temporary interaction only; recordings and saved schedules continue."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
+        return
+    if zoom_app_auth.active(user_id):
+        await zoom_app_auth.cancel(update,context)
         return
     if zoom_auth_bot.active(user_id):
         await zoom_auth_bot.cancel(update, context)
@@ -970,6 +977,13 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     user_id = update.effective_user.id
+    if zoom_app_auth.active(user_id):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await update.message.reply_text('Login matnini Desktop boshqaruv havolasida kiriting. /zoomapplogin havolani qayta yuboradi.')
+        return
     if zoom_auth_bot.active(user_id):
         await zoom_auth_bot.text(update, context)
         return
@@ -3398,6 +3412,9 @@ _HELP_TEXT = (
     "/cancel — Exit setup or input; recordings keep running\n"
     "/exit — End the AI conversation\n"
     "/zoomlogin — Owner: Zoom browser login in private chat\n"
+    "/zoomapplogin — Owner: Zoom Desktop login; /zoomappdone saves\n"
+    "/zoomappcancel — Cancel Desktop login; /zoomappstatus checks\n"
+    "/zoommode — auto, web-guest, web-auth, app-guest, app-auth\n"
     "/zoomstatus — Owner: saved Zoom auth and MongoDB sync\n"
     "/help — Show this guide"
 )
@@ -3549,6 +3566,36 @@ async def cmd_zoom_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await zoom_auth_bot.start(update, context)
 
 
+async def cmd_zoom_app_login(update,context):
+    if not await zoom_auth_bot.authorize(update):
+        return
+    flow=_active_input_flow(update.effective_user.id)
+    if flow and flow!='Zoom Desktop login':
+        await update.message.reply_text(f'Avval {flow} jarayonini tugating yoki /cancel yuboring.')
+        return
+    await zoom_app_auth.start(update,context)
+
+
+async def cmd_zoom_mode(update,context):
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text('Unauthorized.')
+        return
+    try:
+        if context.args:
+            value=' '.join(context.args).strip().lower()
+            if value not in MODES:
+                raise ValueError()
+            set_mode(update.effective_user.id,value)
+        mode=mode_for(update.effective_user.id)
+        await update.message.reply_text('Zoom rejimi: '+mode+'\n'
+            '/zoommode auto — vaziyatga qarab\n'
+            '/zoommode web-guest — web mehmon\n/zoommode web-auth — web akkaunt (/zoomlogin)\n'
+            '/zoommode app-guest — Desktop mehmon\n/zoommode app-auth — Desktop akkaunt (/zoomapplogin)\n'
+            'Tanlov keyingi yozuvga ta’sir qiladi; amaldagi yozuv o‘zgarmaydi.')
+    except (ValueError,OSError):
+        await update.message.reply_text('Rejim saqlanmadi. /zoommode auto|web-guest|web-auth|app-guest|app-auth yuboring.')
+
+
 _auth_sync_task = None
 
 
@@ -3603,6 +3650,7 @@ async def _post_stop(application: Application) -> None:
         _transcription_task.cancel()
         await asyncio.gather(_transcription_task, return_exceptions=True)
     await zoom_auth_bot.close()
+    await zoom_app_auth.close()
     if _auth_sync_task:
         _auth_sync_task.cancel()
         await asyncio.gather(_auth_sync_task, return_exceptions=True)
@@ -3646,6 +3694,11 @@ def main() -> None:
     app.add_handler(CommandHandler(["start", "help"], cmd_unknown))
     app.add_handler(CommandHandler("cancel",        cmd_cancel))
     app.add_handler(CommandHandler("zoomlogin",     cmd_zoom_login))
+    app.add_handler(CommandHandler('zoomapplogin',cmd_zoom_app_login))
+    app.add_handler(CommandHandler('zoomappdone',zoom_app_auth.done))
+    app.add_handler(CommandHandler('zoomappcancel',zoom_app_auth.cancel))
+    app.add_handler(CommandHandler('zoomappstatus',zoom_app_auth.status))
+    app.add_handler(CommandHandler('zoommode',cmd_zoom_mode))
     app.add_handler(CommandHandler("zoomdone",      zoom_auth_bot.done))
     app.add_handler(CommandHandler("zoomcancel",    zoom_auth_bot.cancel))
     app.add_handler(CommandHandler("zoomclick",     zoom_auth_bot.click))
