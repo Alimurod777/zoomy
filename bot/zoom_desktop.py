@@ -5,6 +5,7 @@ import csv
 import fcntl
 import io
 import logging
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -17,7 +18,8 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 from meeting_state import classify_meeting
 from login_link import BrowserLoginLink
 from aiohttp import web
-from desktop_auth_store import DesktopAuthStore, AuthStoreError
+from desktop_auth_store import DesktopAuthStore, AccountDesktopAuthStore, AuthStoreError
+from native_processes import living_pids
 
 ROOT = Path(__file__).resolve().parents[1]
 logger = logging.getLogger(__name__)
@@ -74,7 +76,7 @@ def native_state(lines, meeting_window=False, previously_admitted=False):
     return 'connecting'
 
 
-def blue_audio_buttons(image):
+def blue_audio_buttons(image, preview=False):
     """Candidate filled buttons, only inside a positively identified dialog."""
     from PIL import ImageChops
     r,g,b=image.convert('RGB').split()
@@ -104,8 +106,9 @@ def blue_audio_buttons(image):
                     pixels[neighbor]=0
                     todo.append(neighbor)
         w,h=right-left+1,bottom-top+1
-        if (100<=w<=width*.8 and 18<=h<=70 and count/(w*h)>.55
-                and abs((left+right)/2-width/2)<width*.2 and height*.2<top<height*.75):
+        position = (left>width*.65 and top>height*.7) if preview else (
+            abs((left+right)/2-width/2)<width*.2 and height*.2<top<height*.75)
+        if ((35 if preview else 100)<=w<=width*.8 and 18<=h<=70 and count/(w*h)>.55 and position):
             boxes.append((left,top,right+1,bottom+1))
     return boxes
 
@@ -163,6 +166,15 @@ class NativeDesktopLink(BrowserLoginLink):
         return web.json_response({'ok': False, 'message': 'Desktop profilining nusxasi Zoom yopilgach avtomatik saqlanadi. Hozir Zoom oynasida davom eting.'}, status=409)
 
     async def reload(self, request):
+        if getattr(self.browser,'uri',True) is None:
+            try:
+                async with self.lock:
+                    await self.browser.login_status()
+                    if await self.browser.click_label('Try again'):
+                        return web.json_response({'ok':True,'message':'Zoom login sahifasida qayta urinish bosildi.'})
+                return web.json_response({'ok':False,'message':'Try again tugmasi topilmadi. Telegram’da /zoomappretry ilovani qayta ochadi.'},status=409)
+            except Exception:
+                return web.json_response({'ok':False,'message':'Login yangilanmadi. /zoomappretry bilan qayta oching.'},status=503)
         return web.json_response({'ok': True, 'message': 'Zoom Desktop oynasida davom eting.'})
 
     async def viewport(self, request):
@@ -212,7 +224,9 @@ class NativeDesktopLink(BrowserLoginLink):
 
 
 class NativeZoom:
-    def __init__(self, display, sink, stop_event, guest=False):
+    def __init__(self, display, sink, stop_event, guest=False, account=False):
+        if guest and account:
+            raise ValueError('A native profile cannot be both guest and account')
         self.display = display
         self.display_num = int(display.lstrip(':').split('.')[0])
         self.sink = sink
@@ -231,6 +245,13 @@ class NativeZoom:
         self._last_view_attempt = float('-inf')
         self.auth_store = DesktopAuthStore()
         self.guest = guest
+        self.account_home = None
+        self._account_verified = False
+        if account:
+            identity=AccountDesktopAuthStore().identity
+            name=hashlib.sha256(identity.encode()).hexdigest()[:20]
+            self.account_home=ROOT/'.runtime/zoom-accounts'/name
+            self.auth_store=AccountDesktopAuthStore(home=self.account_home)
         self.guest_home = None
         self.last_backup = 'not-saved'
         if guest:
@@ -248,6 +269,8 @@ class NativeZoom:
         self.terminal_reference = None
         self._last_screen_png = None
         self._last_media_bounds = None
+        self.preview_join = None
+        self._preview_join_clicked_at = float('-inf')
         self.env = {**os.environ, 'DISPLAY': display, 'PULSE_SINK': sink,
                     'LIBGL_ALWAYS_SOFTWARE': '1', 'QT_QPA_PLATFORM': 'xcb',
                     'OMP_THREAD_LIMIT': '2', 'OMP_NUM_THREADS': '2',
@@ -271,7 +294,7 @@ class NativeZoom:
         binary = ROOT / '.runtime/zoom/opt/zoom/ZoomLauncher'
         if not binary.is_file() or not all(shutil.which(p) for p in ('xdotool', 'tesseract', 'openbox')):
             raise RuntimeError('Desktop tayyor emas. bash scripts/setup-zoom-desktop.sh ni bajaring.')
-        existing = (await self.command('pgrep', '-u', str(os.getuid()), '-x', 'zoom')).strip()
+        existing = living_pids((await self.command('pgrep', '-u', str(os.getuid()), '-x', 'zoom')).decode().split())
         if existing:
             raise RuntimeError('Zoom Desktop allaqachon ochiq. Boshqa oynaga ulanmaslik uchun avval uni yoping.')
         # Zoom is a per-user singleton. Never reuse a different recording's app,
@@ -283,6 +306,12 @@ class NativeZoom:
             self.lock_file.close()
             self.lock_file = None
             raise RuntimeError('Zoom Desktop boshqa yozuvda band. U tugagach qayta urinib ko‘ring.') from None
+        if self.account_home:
+            self.account_home.mkdir(parents=True,exist_ok=True,mode=0o700)
+            self.account_home.chmod(0o700)
+            home=str(self.account_home)
+            self.env.update(HOME=home,XDG_CONFIG_HOME=home+'/.config',XDG_DATA_HOME=home+'/.local/share',
+                            XDG_CACHE_HOME=home+'/.cache',XDG_STATE_HOME=home+'/.local/state')
         if self.guest:
             self.guest_home = tempfile.TemporaryDirectory(prefix='zoom-guest-',dir=ROOT/'.runtime')
             home = self.guest_home.name
@@ -339,6 +368,7 @@ class NativeZoom:
 
     async def login_status(self):
         """Positive account controls on the standalone Home screen only."""
+        self._account_verified = False
         await self.read_screen()
         if self._last_screen_png:
             from PIL import Image
@@ -348,16 +378,38 @@ class NativeZoom:
             image.save(buffer,format='PNG')
             data=await self.command('tesseract','stdin','stdout','-l','eng','--psm','11','tsv',
                                     input=buffer.getvalue(),timeout=15)
-            labels=[label.casefold().strip() for label,_,_ in ocr_lines(data.decode(errors='replace'))]
+            parsed=ocr_lines(data.decode(errors='replace'))
+            self.lines.extend((label,x//2,y//2) for label,x,y in parsed)
+            labels=[label.casefold().strip() for label,_,_ in parsed]
         else:
             labels=[label.casefold().strip() for label,_,_ in self.lines]
+        if any(re.search(r'\btry again\b|unable to connect|no internet|check your (?:network|internet)',label)
+               for label in labels):
+            return 'retry-required'
         if any(re.fullmatch(r'sign out|switch account',label) for label in labels):
+            self._account_verified = True
             return 'signed-in'
         if any(re.fullmatch(r'sign in|sign in with.*',label) for label in labels):
             return 'sign-in'
+        if any(re.search(r'email or ph|or sign in with',label) for label in labels):
+            return 'sign-in'
         if any('new meeting' in label for label in labels) and any('schedule' in label for label in labels):
+            self._account_verified = True
             return 'signed-in'
         return 'unknown'
+
+    async def network_status(self):
+        """Probe public sign-in HTTPS on this host; never send account inputs."""
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=8,follow_redirects=False) as client:
+                response=await client.get('https://zoom.us/signin',headers={'User-Agent':'Zoomy-network-check/1'})
+            code=response.status_code
+            logger.info('Native login public HTTPS probe: HTTP %s',code)
+            return f'Zoom HTTPS: HTTP {code}'
+        except Exception as exc:
+            logger.warning('Native login public HTTPS probe failed (%s)',type(exc).__name__)
+            return 'Zoom HTTPS: '+type(exc).__name__
 
     async def snapshot(self):
         if self.process and self.process.returncode is not None:
@@ -371,15 +423,16 @@ class NativeZoom:
         for wid in window_ids[:20]:
             title = (await self.command('xdotool', 'getwindowname', wid)).decode(errors='replace').strip()
             is_audio = bool(re.search(r'(?:audio conference options|join audio)', title, re.I))
-            owner = transient_parent(self.display,wid) if self.admitted and wid != self.meeting_window_id else None
+            owner = transient_parent(self.display,wid) if wid != self.meeting_window_id else None
             owned_modal = owner is not None and (owner==self.meeting_window_id or owner in window_ids)
-            if is_audio or title.casefold() == 'zoom' or owned_modal:
+            prejoin_window = not self.admitted and title.casefold() != 'zoom workplace'
+            if is_audio or title.casefold() == 'zoom' or owned_modal or prejoin_window:
                 audio_dialog = audio_dialog or is_audio
                 geometry=(await self.command('xdotool','getwindowgeometry','--shell',wid)).decode()
                 values=dict(re.findall(r'^(X|Y|WIDTH|HEIGHT)=(-?\d+)$',geometry,re.M))
                 if len(values)==4:
                     x,y,w,h=(int(values[k]) for k in ('X','Y','WIDTH','HEIGHT'))
-                    if 0<=x<x+w<=1920 and 0<=y<y+h<=1200:
+                    if 0<=x<x+w<=1920 and 0<=y<y+h<=1200 and (self.admitted or w*h<1920*1200*.85):
                         popup_regions.append((x,y,x+w,y+h))
                         if is_audio:
                             self.audio_window_rect=(x,y,x+w,y+h)
@@ -392,6 +445,13 @@ class NativeZoom:
                 self.meeting_window_id = wid
         # The computer-audio dialog is centered, outside the status margins.
         await self.read_screen(margins_only=self.admitted and meeting_window, extra_regions=popup_regions)
+        if self.preview_join and not self.admitted and time.monotonic()-self._preview_join_clicked_at>=5:
+            x,y=self.preview_join
+            await self.command('xdotool','mousemove',str(x),str(y),'click','1')
+            self._preview_join_clicked_at=time.monotonic()
+            await self.park_pointer()
+            logger.info('Native pre-join preview: Join selected without account sign-in')
+            return 'connecting'
         signature = next((label.strip().casefold() for label,_,y in self.lines if y < 150
                           and re.search(r"(?:['’]s\s+screen|you are viewing)",label,re.I)), None)
         self.share_seen = self.share_seen or signature is not None or any(
@@ -432,6 +492,7 @@ class NativeZoom:
 
     async def read_screen(self, margins_only=False, extra_regions=()):
         # Read controls/status, never infer host removal from meeting chat text.
+        self.preview_join = None
         image = await self.command('ffmpeg', '-loglevel', 'error', '-f', 'x11grab', '-draw_mouse', '0',
                 '-s', '1920x1200', '-i', self.display, '-frames:v', '1', '-threads', '1', '-f', 'image2pipe', '-vcodec', 'png', '-')
         if not image:
@@ -456,13 +517,20 @@ class NativeZoom:
         async def enhanced(region,rect,scale,psm='11',button=False):
             if button:
                 region=ImageOps.invert(region.convert('L').point(lambda v:255 if v>200 else 0))
+                # Rounded blue button corners otherwise become black OCR
+                # noise, especially for the short "Join" label.
+                clean=Image.new('L',region.size,'white')
+                clean.paste(region.crop((5,4,region.width-5,region.height-4)),(5,4))
+                region=clean
             region=region.resize((region.width*scale,region.height*scale))
             buffer=io.BytesIO()
             region.save(buffer,format='PNG')
             result=await self.command('tesseract','stdin','stdout','-l','eng','--psm',psm,'tsv',
                                       input=buffer.getvalue(),timeout=12)
-            self.lines.extend((label,rect[0]+x//scale,rect[1]+y//scale)
-                              for label,x,y in ocr_lines(result.decode(errors='replace')))
+            parsed=[(label,rect[0]+x//scale,rect[1]+y//scale)
+                    for label,x,y in ocr_lines(result.decode(errors='replace'))]
+            self.lines.extend(parsed)
+            return parsed
         if time.monotonic()-self._last_header_ocr>5:
             self._last_header_ocr=time.monotonic()
             await enhanced(source.crop((0,0,1920,100)),(0,0,1920,100),3)
@@ -476,6 +544,14 @@ class NativeZoom:
         for rect in extra_regions:
             if rect != self.audio_window_rect:
                 await enhanced(source.crop(rect),rect,2)
+            local=' '.join(label for label,x,y in self.lines if rect[0]<=x<rect[2] and rect[1]<=y<rect[3]).lower()
+            if (not self.admitted and re.search(r'always show.*preview.*joining',local)
+                    and not ('participants' in local and 'leave' in local)):
+                region=source.crop(rect)
+                for box in blue_audio_buttons(region,preview=True):
+                    absolute=(rect[0]+box[0],rect[1]+box[1],rect[0]+box[2],rect[1]+box[3])
+                    labels=await enhanced(region.crop(box),absolute,3,psm='7',button=True)
+                    self.preview_join=next(((x,y) for label,x,y in labels if re.fullmatch(r'join[.,]?',label.strip(),re.I)),None)
         if self.admitted and self.share_seen:
             from native_video import media_bounds
             bounds = media_bounds(source)
@@ -639,7 +715,7 @@ class NativeZoom:
             except ProcessLookupError:
                 pass
         try:
-            if graceful and save_profile:
+            if graceful and save_profile and (self.account_home is None or self._account_verified):
                 outcome = await self.auth_store.backup()
                 self.last_backup = outcome
                 logger.info('Desktop profile backup: %s (account login not verified)', outcome)

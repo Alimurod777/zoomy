@@ -92,14 +92,20 @@ prevent fallback or `desktop` to force the native client when a browser cannot
 identify the restriction. Native support is experimental: admission is checked
 from visible meeting controls, and an open app alone does not start recording.
 
-Desktop login is separate from MongoDB browser cookies.
+Desktop login is separate from MongoDB browser cookies. `/zoomapplogin` and
+`app-auth` use a dedicated persistent HOME under `.runtime/zoom-accounts/`,
+separate from guest and legacy profiles. Each account identity and server has
+its own private directory and encrypted `desktop_auth` snapshot namespace.
+Legacy snapshots remain available but do not populate this account profile.
+Desktop state may be bound to its OS/device, so a different Services host needs
+a new login rather than importing another host's unverified native state.
 Guest-enabled app-only meetings do not require account sign-in: the native
 invitation opens directly and recording starts after admission. A Home screen
 offering Sign in is not treated as a meeting authentication requirement.
 Waiting for the host or admission does not trigger an interactive login link.
 After successful
-account sign-in, Zoom maintains its local profile (`~/.zoom/data` and
-`~/.config/zoomus.conf`); enable Keep me signed in if offered. The recorder
+account sign-in, Zoom maintains its local profile (the selected HOME's
+`.zoom/data` and `.config/zoomus.conf`); enable Keep me signed in if offered. The recorder
 does not delete that profile or sign the account out. With MongoDB configured,
 `ZOOM_DESKTOP_SYNC=true` (default) encrypts a bounded native profile snapshot
 after Zoom closes gracefully. Before opening Zoom, an empty local profile is
@@ -175,6 +181,12 @@ UI verification and a saved profile do not guarantee a future meeting will
 accept that account, domain, device or expired session. Only the owner receives
 interactive access to the shared account profile; other authorized users get
 instructions rather than waiting indefinitely for a private login link.
+New guest profiles show Zoom's audio/video preview. Its owned window and
+preview text are checked before selecting only the blue Join button; the
+nearby Sign in button is not selected. Login forms and Try again pages are
+reported separately. `/zoomappstatus` can probe public Zoom HTTPS from the
+actual service host; `/zoomappretry` reopens login without uploading an
+unverified profile. A successful HTTPS probe is not an account verification.
 
 1. **URL or Meeting ID** — pass inline or send after the prompt (100s timeout → cancelled)
    - Full URL with password: `https://zoom.us/j/97856007427?pwd=xxx`

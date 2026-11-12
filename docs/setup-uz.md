@@ -320,6 +320,15 @@ quyidagi noVNC usulidan foydalaning. Login tasdiqlanmasdan sessiya saqlanmaydi.
 
 ### Kirish usulini tanlash va Desktop login
 
+Login uchun eski mehmon/konferensiya profili qayta ishlatilmaydi.
+`/zoomapplogin` va `app-auth` `.runtime/zoom-accounts/` ichidagi alohida,
+doimiy, faqat egasi o‘qiy oladigan HOME bilan ishlaydi. Har bir `ZOOM_AUTH_ID`
+va server uchun alohida papka hamda shifrlangan MongoDB yozuvi bor. Eski
+profil va snapshotlar saqlanadi, yangi akkaunt profiliga avtomatik kiritilmaydi.
+Native holat OS/qurilmaga bog‘liq bo‘lishi mumkin: boshqa Services serveriga
+ko‘chirilsa qayta login kerak bo‘ladi. Shu serverda qayta ishga tushirishda
+doimiy profil ishlatiladi. Tasdiqlanmagan akkaunt profili Mongo’ga yuborilmaydi.
+
 `/zoommode auto` — avval web mehmon; akkaunt talab qilinsa saqlangan web auth;
 ilova kerak bo‘lsa Desktop mehmon, akkaunt talab qilinsa Desktop auth sinovi.
 App-only havolada qo‘llab-quvvatlanmaydigan web bosqichlari tashlab o‘tiladi.
@@ -341,6 +350,11 @@ Desktop’ga oldindan kirish, faqat bot egasining shaxsiy chatida:
 `/cancel` — yopish (umumiy Mongo nusxasi almashtirilmaydi). Web login uchun
 `/zoomlogin` avvalgidek ishlaydi. Profil nusxasi Mongo’da saqlansa ham Zoom
 keyinchalik qayta kirish, SSO, CAPTCHA yoki yangi MFA talab qilishi mumkin.
+`Try again` chiqsa `/zoomappstatus` xizmatning o‘z serveridan Zoom HTTPS
+ulanishini ham tekshiradi. `/zoomappretry` loginni qayta ochadi. HTTPS `200`
+chiqishi akkauntga kirilganini bildirmaydi. Yangi mehmon profilidagi audio/video
+preview oynasi tanilib **Join** bosiladi; yonidagi **Sign in** bosilmaydi.
+Bu preview kirish tasdiqlangan yoki login talab qilingan holat hisoblanmaydi.
 
 Qotib qolmaslik chegaralari: login oynasini ochish 60 soniya, yozuv uchun
 ilovani ochish 45 soniya, alohida login

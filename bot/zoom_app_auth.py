@@ -76,7 +76,7 @@ class ZoomAppAuth:
             from recorder import DisplayPool
             self.pool=DisplayPool(base=int(os.getenv('ZOOM_LOGIN_DISPLAY') or '90'),max_slots=1)
             self.number,display,sink=await self.pool.acquire()
-            self.native=NativeZoom(display,sink.removesuffix('.monitor'),asyncio.Event())
+            self.native=NativeZoom(display,sink.removesuffix('.monitor'),asyncio.Event(),account=True)
             await self.native.open()
             # Sign in may be entered manually if the initial button is not yet visible.
             await self.native.read_screen()
@@ -117,6 +117,12 @@ class ZoomAppAuth:
                 await update.message.reply_text('Login tekshiruvi bajarilmadi. Qayta urinib ko‘ring yoki /zoomappcancel yuboring.')
                 return
             if status!='signed-in':
+                if status=='retry-required':
+                    network=await self.native.network_status()
+                    await update.message.reply_text('Zoom login sahifasi qayta urinish so‘rayapti. '+network+
+                        '. /zoomappretry ilovani qayta ochadi; /zoomappcancel yopadi. '
+                        'HTTPS ochilishi akkaunt loginini tasdiqlamaydi.')
+                    return
                 await update.message.reply_text('Akkauntga kirish hali tasdiqlanmadi. Login/2FA/SSO’ni yakunlang; '
                     'profil menyusida Sign out ko‘rinsin. /zoomappdone qayta tekshiradi; /zoomappcancel bekor qiladi.')
                 return
@@ -137,7 +143,9 @@ class ZoomAppAuth:
             return
         try:
             status=await asyncio.wait_for(self.native.login_status(),25)
-            await update.message.reply_text('Desktop login holati: '+status+'. /zoomappdone yoki /zoomappcancel.')
+            network=(' '+await self.native.network_status()+'.') if status=='retry-required' else ''
+            await update.message.reply_text('Desktop login holati: '+status+'.'+network+
+                ' /zoomappretry — qayta ochish; /zoomappdone — saqlash; /zoomappcancel — yopish.')
         except Exception:
             await update.message.reply_text('Holat tekshiruvi bajarilmadi. /zoomappcancel bilan yopishingiz mumkin.')
 
@@ -146,6 +154,12 @@ class ZoomAppAuth:
             return
         await self.close()
         await update.message.reply_text('Desktop login yopildi; umumiy MongoDB nusxasi almashtirilmadi.')
+
+    async def retry(self,update,context):
+        if not ZoomAuthBot.allowed(update):
+            return
+        await self.close()
+        await self.start(update,context)
 
 
 zoom_app_auth=ZoomAppAuth()

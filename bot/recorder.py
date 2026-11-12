@@ -1634,6 +1634,7 @@ class ZoomRecorder:
                 # Guest admission through the native app must not depend on it.
                 logger.warning('Browser profile name unavailable (%s); native join uses configured guest name', type(exc).__name__)
         native = (NativeZoom(self.display,self.sink_name,self._stop_event,guest=True) if self._native_guest
+                  else NativeZoom(self.display,self.sink_name,self._stop_event,account=True) if self._native_require_auth
                   else NativeZoom(self.display, self.sink_name, self._stop_event))
         try:
             opening=(native.open(url,self.guest_name,require_auth=True) if self._native_require_auth

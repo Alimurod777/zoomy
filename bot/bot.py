@@ -3414,6 +3414,7 @@ _HELP_TEXT = (
     "/zoomlogin — Owner: Zoom browser login in private chat\n"
     "/zoomapplogin — Owner: Zoom Desktop login; /zoomappdone saves\n"
     "/zoomappcancel — Cancel Desktop login; /zoomappstatus checks\n"
+    "/zoomappretry — Reopen Desktop login after Try again/network error\n"
     "/zoommode — auto, web-guest, web-auth, app-guest, app-auth\n"
     "/zoomstatus — Owner: saved Zoom auth and MongoDB sync\n"
     "/help — Show this guide"
@@ -3576,6 +3577,16 @@ async def cmd_zoom_app_login(update,context):
     await zoom_app_auth.start(update,context)
 
 
+async def cmd_zoom_app_retry(update,context):
+    if not await zoom_auth_bot.authorize(update):
+        return
+    flow=_active_input_flow(update.effective_user.id)
+    if flow and flow!='Zoom Desktop login':
+        await update.message.reply_text(f'Avval {flow} jarayonini tugating yoki /cancel yuboring.')
+        return
+    await zoom_app_auth.retry(update,context)
+
+
 async def cmd_zoom_mode(update,context):
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text('Unauthorized.')
@@ -3698,6 +3709,7 @@ def main() -> None:
     app.add_handler(CommandHandler('zoomappdone',zoom_app_auth.done))
     app.add_handler(CommandHandler('zoomappcancel',zoom_app_auth.cancel))
     app.add_handler(CommandHandler('zoomappstatus',zoom_app_auth.status))
+    app.add_handler(CommandHandler('zoomappretry',cmd_zoom_app_retry))
     app.add_handler(CommandHandler('zoommode',cmd_zoom_mode))
     app.add_handler(CommandHandler("zoomdone",      zoom_auth_bot.done))
     app.add_handler(CommandHandler("zoomcancel",    zoom_auth_bot.cancel))

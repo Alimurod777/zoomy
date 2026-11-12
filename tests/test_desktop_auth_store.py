@@ -186,8 +186,10 @@ class DesktopStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_idle_checks_real_process_exit_status(self):
         store = DesktopAuthStore(self.home)
         for code in (0, 1, 2):
-            proc = SimpleNamespace(wait=AsyncMock(return_value=code), returncode=code)
-            with patch('desktop_auth_store.asyncio.create_subprocess_exec', AsyncMock(return_value=proc)):
+            proc = SimpleNamespace(wait=AsyncMock(return_value=code), returncode=code,
+                communicate=AsyncMock(return_value=(b'123' if code==0 else b'',b'')))
+            with patch('desktop_auth_store.asyncio.create_subprocess_exec', AsyncMock(return_value=proc)), \
+                    patch('desktop_auth_store.living_pids',return_value=['123'] if code==0 else []):
                 if code == 1:
                     await store._idle()
                 else:

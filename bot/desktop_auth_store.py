@@ -16,6 +16,7 @@ import stat
 import tempfile
 
 from auth_store import AuthStore, AuthStoreError
+from native_processes import living_pids
 
 MAX_BYTES = 8 * 1024 * 1024  # base64 + Fernet still fit a 16 MiB Mongo document
 CONFIGS = {'.config/zoomus.conf', '.config/zoom.conf'}
@@ -52,14 +53,14 @@ class DesktopAuthStore(AuthStore):
 
     async def _idle(self):
         proc = await asyncio.create_subprocess_exec('pgrep', '-u', str(os.getuid()), '-x', 'zoom',
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         try:
-            code = await asyncio.wait_for(proc.wait(), 3)
+            out,_ = await asyncio.wait_for(proc.communicate(), 3)
         finally:
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
-        if code != 1:
+        if proc.returncode not in {0,1} or living_pids(out.decode().split()):
             raise AuthStoreError('Desktop profile sync requires Zoom to be closed')
 
     def _safe_path(self, name):
@@ -202,3 +203,20 @@ class DesktopAuthStore(AuthStore):
             raise
         except Exception:
             raise AuthStoreError('Desktop snapshot upload failed; local profile preserved') from None
+
+
+class AccountDesktopAuthStore(DesktopAuthStore):
+    def __init__(self,home=None):
+        super().__init__(home)
+        try:
+            machine=Path('/etc/machine-id').read_text().strip()
+        except OSError:
+            machine=''
+        self.device=hashlib.sha256(f'{self.device}:{machine}'.encode()).hexdigest()
+
+    @property
+    def identity(self):
+        # Old snapshots may be guest/meeting profiles with broken login state.
+        # Keep them available, but never bootstrap the dedicated account Home
+        # from those unverified legacy snapshots.
+        return super().identity + ':account-v1:' + self.device

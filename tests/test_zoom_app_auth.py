@@ -101,5 +101,19 @@ class AppAuthTests(unittest.IsolatedAsyncioTestCase):
         pool.release.assert_awaited_once_with(92)
         self.assertNotIn('private-data',str(self.context.bot.send_message.call_args))
 
+    async def test_try_again_reports_connectivity_without_saving_auth(self):
+        native,pool=self.active('retry-required')
+        native.network_status=AsyncMock(return_value='Zoom HTTPS: HTTP 200')
+        await self.auth.done(self.update,self.context)
+        self.assertIn('HTTP 200',self.update.message.reply_text.call_args.args[0])
+        native.close.assert_not_awaited()
+
+    async def test_retry_reopens_without_overwriting_snapshot(self):
+        native,pool=self.active()
+        with patch.object(self.auth,'start',new=AsyncMock()) as start:
+            await self.auth.retry(self.update,self.context)
+        native.close.assert_awaited_once_with(save_profile=False)
+        start.assert_awaited_once_with(self.update,self.context)
+
 
 if __name__=='__main__':unittest.main()
