@@ -500,6 +500,7 @@ class ZoomRecorder:
         self._join_mode = None
         self._native_guest = False
         self._native_require_auth = False
+        self._web_route_chosen = False
         self._admission_notice = None
         self._reconnect_count = 0
         self.recording_prefix = recording_prefix
@@ -1458,11 +1459,13 @@ class ZoomRecorder:
         if page.url.startswith("chrome-error:"):
             return "disconnected"
         snapshot = await asyncio.wait_for(page.evaluate(SNAPSHOT_JS), timeout=5)
-        if self._native_handoff_seen:
+        if self._native_handoff_seen and not self._web_route_chosen:
             snapshot['app_launch'] = True
         return classify_meeting(snapshot)
 
     def _observe_desktop_handoff(self, event):
+        if self._web_route_chosen:
+            return
         url = urlparse(event.get('url', ''))
         host = (url.hostname or '').lower()
         if url.scheme not in {'zoommtg', 'zoomus'} or not (host == 'zoom.us' or host.endswith('.zoom.us')):
@@ -1493,33 +1496,43 @@ class ZoomRecorder:
         """
         if self._stop_event.is_set() or '/wc/' in urlparse(invitation).path:
             return web_url, False
-        deadline = time.monotonic() + 10
         try:
             await page.goto(invitation, wait_until='domcontentloaded', timeout=8000)
         except Exception:
             if self._stop_event.is_set():
                 return web_url, False
+        # Zoom can emit zoommtg:// before hydrating its browser alternative.
+        # An offered app launch is a preference, not proof of app-only policy.
+        deadline = time.monotonic() + 6
+        app_offered = False
         while not self._stop_event.is_set() and time.monotonic() < deadline:
-            browser_link = page.get_by_text(re.compile(r'join from (?:your |the )?browser', re.I))
-            if await browser_link.count() and await browser_link.first.is_visible():
+            browser_link = page.get_by_text(re.compile(r'join from (?:(?:your|the|a) )?browser', re.I))
+            available = False
+            for index in range(min(await browser_link.count(),20)):
+                item=browser_link.nth(index)
+                if await item.is_visible() and await item.is_enabled():
+                    available=True
+                    break
+            if available:
                 self._native_handoff_seen = False
+                self._web_route_chosen = True
+                logger.info('Invitation offers browser join; selecting Web App')
                 return web_url, False
             try:
                 state = await self._state(page)
             except Exception:
-                if self._native_handoff_seen:
-                    raise self._join_exception('app_launch')
+                app_offered = app_offered or self._native_handoff_seen
                 state = 'connecting'
             if state in {'app_launch', 'app_required'}:
-                logger.info('Invitation requests Zoom Desktop; skipping web-client preview')
-                raise self._join_exception(state)
+                app_offered = True
             if state in {'admitted', 'waiting_room', 'waiting_host'}:
                 return web_url, True
             if state in {'auth_required', 'removed', 'ended', 'invalid', 'passcode'}:
                 raise self._join_exception(state)
             if await self._wait_or_stop(0.25):
                 break
-        if self._native_handoff_seen:
+        if app_offered or self._native_handoff_seen:
+            logger.info('Invitation has no usable browser alternative after hydration; selecting Desktop')
             raise self._join_exception('app_launch')
         return web_url, False
 
@@ -1720,7 +1733,8 @@ class ZoomRecorder:
                         if owner and str(self.user_id) == owner and self.on_waiting:
                             try:
                                 link = await asyncio.wait_for(native.control_link(),20)
-                                await self.on_waiting("Desktop kirish oynasini boshqarish uchun (15 daqiqa; Zoom talab qilsagina login qiling): " + link)
+                                await self.on_waiting('Desktop kirish oynasini boshqarish uchun (faqat ushbu sessiya faol turguncha; '
+                                    'sessiya tugasa havola yopiladi; Zoom talab qilsagina login qiling): '+link)
                             except Exception:
                                 await self.on_waiting("Desktop boshqaruv havolasi ochilmadi. setup-login-link.sh sozlamalarini tekshiring.")
                                 if auth_since is not None:

@@ -7,6 +7,7 @@ def classify_meeting(snapshot):
     if isinstance(snapshot, str):
         snapshot = {"text": snapshot}
     text = re.sub(r"\s+", " ", snapshot.get("text", "")).lower().replace("’", "'")
+    browser_available = snapshot.get('browser_available', False)
     phrases = {
         "removed": ("removed from this meeting", "you have been removed", "host has denied", "not allowed to rejoin"),
         "ended": ("been ended by host", "been ended by the host", "meeting has ended", "meeting is ended", "host has ended"),
@@ -24,13 +25,13 @@ def classify_meeting(snapshot):
     for state, options in phrases.items():
         if state in {"waiting_room", "waiting_host"} and snapshot.get("waiting_room"):
             return "waiting_room"
-        if state == "app_required" and any(option in text for option in ("join from your browser", "join from browser")):
+        if state == "app_required" and (browser_available or any(option in text for option in ("join from your browser", "join from browser"))):
             continue
         if any(phrase in text for phrase in options):
             return state
     if snapshot.get("waiting_room"):
         return "waiting_room"
-    if snapshot.get('app_launch') and not snapshot.get('admitted'):
+    if snapshot.get('app_launch') and not snapshot.get('admitted') and not browser_available:
         return 'app_launch'
     if snapshot.get("admitted"):
         return "admitted"
@@ -49,8 +50,11 @@ SNAPSHOT_JS = r'''() => {
     const notices=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[role="alert"],.zm-modal,.reconnecting-dialog')]
         .filter(visible).map(el=>el.innerText||'').join(' ');
     const launchLabels=/^(launch (meeting|zoom(?: workplace)?)|open zoom(?: meetings| workplace| app)?|join (?:from|in) (?:the )?app|join from (?:the )?zoom workplace app|открыть zoom|запустить конференцию)$/i;
-    const app_launch=!admitted&&[...document.querySelectorAll('a,button,[role="button"]')].some(el=>
+    const controls=[...document.querySelectorAll('a,button,[role="button"]')];
+    const browser_available=controls.some(el=>visible(el)&&!el.disabled&&el.getAttribute('aria-disabled')!=='true'
+        &&/join from (?:(?:your|the|a) )?browser/i.test(el.innerText||el.getAttribute('aria-label')||''));
+    const app_launch=!admitted&&!browser_available&&controls.some(el=>
         visible(el)&&(launchLabels.test((el.innerText||el.getAttribute('aria-label')||'').trim())
             || /^(zoommtg|zoomus):\/\//i.test(el.getAttribute('href')||'')));
-    return {text:admitted&&!waiting_room?notices:(document.body.innerText||''),admitted,waiting_room,app_launch};
+    return {text:admitted&&!waiting_room?notices:(document.body.innerText||''),admitted,waiting_room,app_launch,browser_available};
 }'''

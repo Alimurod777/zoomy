@@ -185,6 +185,40 @@ class BrowserAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(resume)
         self.assertFalse(recorder._native_handoff_seen)
 
+    async def test_delayed_browser_option_overrides_early_native_intent(self):
+        invite='https://zoom.us/j/97856007427?pwd=example'
+        async def route(r):
+            await r.fulfill(body='''<button>Join from Zoom Workplace app</button>
+              <script>setTimeout(()=>document.body.insertAdjacentHTML('beforeend',
+                '<button>Join from browser</button>'),1200)</script>''',content_type='text/html')
+        await self.page.route(invite,route)
+        recorder=ZoomRecorder();recorder.current_url=invite;recorder._native_handoff_seen=True
+        target,resume=await recorder._choose_join_target(self.page,invite,URL)
+        self.assertEqual(target,URL)
+        self.assertFalse(resume)
+        self.assertTrue(recorder._web_route_chosen)
+        self.assertFalse(recorder._native_handoff_seen)
+        recorder._observe_desktop_handoff({'url':'zoommtg://zoom.us/join?confno=97856007427'})
+        self.assertFalse(recorder._native_handoff_seen)
+
+    async def test_hidden_duplicate_does_not_hide_a_visible_browser_choice(self):
+        invite='https://zoom.us/j/97856007427?pwd=example'
+        async def route(r):
+            await r.fulfill(body='''<button>Join from Zoom Workplace app</button>
+              <a style="display:none">Join from browser</a><button>Join from browser</button>''',content_type='text/html')
+        await self.page.route(invite,route)
+        recorder=ZoomRecorder();recorder.current_url=invite
+        target,_=await recorder._choose_join_target(self.page,invite,URL)
+        self.assertEqual(target,URL)
+
+    async def test_snapshot_does_not_treat_offered_app_as_required_with_browser_choice(self):
+        await self.page.set_content('<button>Join from Zoom Workplace app</button><button>Join from browser</button>')
+        state=await self.page.evaluate(SNAPSHOT_JS)
+        self.assertTrue(state['browser_available'])
+        self.assertFalse(state['app_launch'])
+        recorder=ZoomRecorder();recorder._native_handoff_seen=True
+        self.assertEqual(await recorder._state(self.page),'connecting')
+
     async def test_delayed_name_input_is_filled_and_mute_is_not_used_as_join(self):
         html='''<div id="root"></div><script>window.mutes=0;window.joins=0;
         setTimeout(()=>{document.querySelector('#root').innerHTML=`

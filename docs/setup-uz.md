@@ -51,13 +51,19 @@ oralig‘i yozuvga kiritilmaydi. Host efirni tugatsa yoki botni chiqarsa yozuv
 to‘xtaydi. Qo‘lda ism tanlash va rejalashtirish uchun `AUTO_RECORD_SETUP=false`.
 
 `ZOOM_JOIN_MODE=auto` avval asl taklif havolasini tekshiradi. Sahifa
-**Join from Zoom Workplace app** desa yoki joriy meeting uchun `zoommtg://`
-so‘rovini yuborsa, Web App URL’iga almashtirmasdan haqiqiy Linux Zoom
-Desktop’ga o‘tadi. **Join from Your Browser** varianti bo‘lsa Web App tanlanadi. Cheklov sahifada
+**Join from Zoom Workplace app** yoki `zoommtg://` signali chiqsa ham, bot
+sahifaning kechikib yuklanadigan brauzer variantini 6 soniyagacha kutadi.
+**Join from browser / Your Browser** mavjud bo‘lsa Web App tanlanadi;
+brauzer varianti topilmasa haqiqiy Linux Zoom Desktop’ga o‘tadi. Cheklov sahifada
 aniqlanmayotgan bo‘lsa `ZOOM_JOIN_MODE=desktop` bilan to‘g‘ridan-to‘g‘ri
 ilovadan kirish mumkin. `web` faqat brauzer yo‘lini ishlatadi.
 
 Desktop’ni tayyorlash (bu serverda bajarildi):
+
+Yozuv paytidagi Desktop boshqaruv havolasi faqat sessiya faol turguncha
+ishlaydi. Sessiya xato bilan yoki `/stop` orqali tugasa tunnel yopiladi;
+eski havolada Cloudflare 1033 chiqishi mumkin. Keyingi sessiya yangi havola
+oladi. Alohida `/zoomapplogin` jarayonining 15 daqiqalik muddati boshqa.
 
 ```bash
 bash scripts/setup-zoom-desktop.sh

@@ -83,10 +83,12 @@ waiting rooms keep their queue position. Transient disconnects retry up to
 `ZOOM_RECONNECT_ATTEMPTS=5`, preserving and merging recorded segments.
 A host ending the meeting or removing the bot stops the recording.
 
-`ZOOM_JOIN_MODE=auto` first opens the original invitation. A “Join from Zoom
-Workplace app” button or a matching native protocol request selects the official
-Linux Zoom Desktop client before any `/wc/.../join` rewrite. An explicit
-“Join from Your Browser” option keeps the Web App route. Install it with
+`ZOOM_JOIN_MODE=auto` first opens the original invitation. An app button or
+native protocol request waits up to six seconds for delayed browser controls.
+A visible, enabled “Join from browser / Your Browser” option takes priority,
+including when hidden duplicate elements exist. Later automatic app intents
+cannot override that choice. Without a browser alternative, the official
+Linux Zoom Desktop client is selected before any `/wc/.../join` rewrite. Install it with
 `bash scripts/setup-zoom-desktop.sh` after the runtime setup. Use `web` to
 prevent fallback or `desktop` to force the native client when a browser cannot
 identify the restriction. Native support is experimental: admission is checked
@@ -122,6 +124,9 @@ text checkbox switches between replacement and appending. Browser edits verify
 that an editable field has focus; native edits send fixed keyboard actions to
 the focused desktop field. The token, expiry, and origin checks apply to editing.
 
+Recording control links exist only while their session is active (at most
+15 minutes); stopping or failing the session closes the tunnel and invalidates
+the link. A later Cloudflare 1033 on that old URL does not reopen the session.
 Only `OWNER_TELEGRAM_ID` receives a temporary control link for login or
 additional prompts. Native Zoom supports one recording per server user; it uses
 a silent virtual microphone and the session's dedicated audio sink. Native
