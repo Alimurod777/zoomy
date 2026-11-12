@@ -540,6 +540,9 @@ class ZoomRecorder:
         self._native_shared_seen = False
         self._native_terminal_reference = None
         self._native_final_duration = None
+        self._capture_stopped_at = None
+        self._media_mode = 'not-ready'
+        self._crashed_page_ids = set()
         self._segments: list[Path] = []
         self._paused: bool = False
         self._paused_total: float = 0.0          # accumulated paused seconds
@@ -564,9 +567,12 @@ class ZoomRecorder:
         """
         if self._record_start_time is None:
             return 0
-        total = time.monotonic() - self._record_start_time - self._paused_total
+        if self._native_final_duration is not None:
+            return int(self._native_final_duration)
+        now=self._capture_stopped_at if self._capture_stopped_at is not None else time.monotonic()
+        total = now - self._record_start_time - self._paused_total
         if self._paused and self._pause_started is not None:
-            total -= time.monotonic() - self._pause_started
+            total -= now - self._pause_started
         return int(max(0, total))
 
     def elapsed_str(self) -> str:
@@ -584,14 +590,34 @@ class ZoomRecorder:
         try:
             size = self._current_total_bytes()
             if size > 0:
-                if size >= 1_073_741_824:
-                    return f"{size / 1_073_741_824:.1f} GB"
-                if size >= 1_048_576:
-                    return f"{size / 1_048_576:.1f} MB"
-                return f"{size / 1024:.1f} KB"
+                if size >= 1_000_000_000:
+                    return f"{size / 1_000_000_000:.1f} GB"
+                if size >= 1_000_000:
+                    return f"{size / 1_000_000:.2f} MB"
+                return f"{size / 1000:.1f} KB"
         except Exception:
             pass
         return "—"
+
+    def progress_snapshot(self):
+        try:
+            size=self._current_total_bytes()
+        except OSError:
+            size=0
+        if self._session_errored:
+            phase='error'
+        elif not self.is_recording:
+            phase='finished'
+        elif self._stop_event.is_set() or (self._capture_stopped_at is not None and not self._paused):
+            phase='processing'
+        elif self._paused:
+            phase='paused'
+        elif self._record_start_time is None:
+            phase='waiting'
+        else:
+            phase='recording'
+        return {'phase':phase,'seconds':self.recording_elapsed_secs(),'bytes':size,
+                'name':self.recording_prefix or 'Avtomatik nom','source':self._media_mode}
 
     async def record(self, url: str) -> None:
         self.is_recording = True
@@ -1452,13 +1478,23 @@ class ZoomRecorder:
             await self.on_error(msg)
 
     async def _state(self, page: Page) -> str:
+        if id(page) in self._crashed_page_ids:
+            return 'disconnected'
         if page.is_closed():
             return "disconnected"
         if re.search(r"/(signin|login)(?:[/?#]|$)", page.url, re.I):
             return "auth_required"
         if page.url.startswith("chrome-error:"):
             return "disconnected"
-        snapshot = await asyncio.wait_for(page.evaluate(SNAPSHOT_JS), timeout=5)
+        try:
+            snapshot = await asyncio.wait_for(page.evaluate(SNAPSHOT_JS), timeout=5)
+        except Exception as exc:
+            if re.search(r'(?:target|page) crashed', str(exc), re.I):
+                self._crashed_page_ids.add(id(page))
+                return 'disconnected'
+            raise
+        if snapshot.get('media_mode'):
+            self._media_mode=snapshot['media_mode']
         if self._native_handoff_seen and not self._web_route_chosen:
             snapshot['app_launch'] = True
         return classify_meeting(snapshot)
@@ -1581,6 +1617,9 @@ class ZoomRecorder:
             return MeetingJoinError('Konferensiya akkaunt talab qiladi. /zoomlogin va /zoommode web-auth yuboring.')
         return MeetingJoinError(self._join_error(state))
 
+    def _track_browser_page(self, page):
+        page.on('crash', lambda *_: self._crashed_page_ids.add(id(page)))
+
     async def _enter_web(self,browser,invitation,web_url,mode):
         zoom_state=None
         if mode in {'web','web-auth'}:
@@ -1598,6 +1637,7 @@ class ZoomRecorder:
                 storage_state=({k:v for k,v in zoom_state.items() if k in {'cookies','origins'}}
                                if isinstance(zoom_state,dict) else zoom_state))
             page=await ctx.new_page()
+            self._track_browser_page(page)
             await self._monitor_desktop_handoff(page)
             try:
                 target,resume=(await self._choose_join_target(page,invitation,web_url)
@@ -1633,6 +1673,7 @@ class ZoomRecorder:
 
     async def _record_native(self, url):
         from zoom_desktop import NativeZoom
+        self._media_mode='desktop'
         if self._stop_event.is_set():
             return
         if self.use_profile_name and not self._native_guest:
@@ -2117,8 +2158,19 @@ class ZoomRecorder:
             await asyncio.to_thread(self.request_pause)
         await self._notice_admission("disconnected")
         try:
-            if page.is_closed():
-                page = await page.context.new_page()
+            if page.is_closed() or id(page) in self._crashed_page_ids:
+                crashed = id(page) in self._crashed_page_ids
+                old_page = page
+                page = await asyncio.wait_for(old_page.context.new_page(), timeout=15)
+                self._track_browser_page(page)
+                if crashed:
+                    if self.on_waiting:
+                        await self.on_waiting('Brauzer oynasi qulab tushdi. Yozuv pauzada; yangi oynada qayta ulanyapman.')
+                    try:
+                        await asyncio.wait_for(old_page.close(), timeout=2)
+                    except Exception:
+                        pass
+                    self._crashed_page_ids.discard(id(old_page))
             if not waiting_room and await self._wait_or_stop(5):
                 return None
             current = await self._state(page)
@@ -2143,6 +2195,7 @@ class ZoomRecorder:
             return None
 
     async def _watch_meeting(self, page: Page) -> str:
+        state_failures = 0
         while not self._stop_event.is_set():
             try:
                 # FFmpeg health check — if process exited, encoding stopped
@@ -2158,6 +2211,7 @@ class ZoomRecorder:
                     return "encoder_failed"
 
                 state = await self._state(page)
+                state_failures = 0
                 if state in {"ended", "removed", "app_required", "app_launch", "auth_required", "invalid", "passcode"}:
                     logger.info("Meeting terminal state: %s", state)
                     if state != "ended" and self.on_error:
@@ -2168,6 +2222,11 @@ class ZoomRecorder:
                 if "zoom.us/wc" not in page.url:
                     return "disconnected"
             except Exception as e:
+                state_failures += 1
+                if state_failures >= 3:
+                    logger.warning('Meeting page unresponsive; attempting reconnection')
+                    self._crashed_page_ids.add(id(page))
+                    return 'disconnected'
                 logger.debug("Watch loop iteration error (will retry): %s", e)
             # Breakout invites are handled before generic dialog dismissal so the
             # Join/Not Now modal is never swept away as a stray notification;
@@ -2210,14 +2269,17 @@ class ZoomRecorder:
                 if crop_y > 0 else None)
 
     def _start_ffmpeg(self, output: str, chrome_height: int = 0) -> subprocess.Popen:
+        self._capture_stopped_at=None
+        fps=max(1,min(30,int(os.getenv('RECORD_FPS') or '15')))
         cmd = [
             "ffmpeg", "-y",
             "-loglevel", "warning", "-nostats",
-            "-f", "x11grab", "-draw_mouse", "0", "-r", str(max(1,min(30,int(os.getenv("RECORD_FPS") or "15")))) , "-s", "1920x1200", "-i", self.display,
+            "-f", "x11grab", "-draw_mouse", "0", "-r", str(fps), "-s", "1920x1200", "-i", self.display,
             "-f", "pulse", "-i", self.sink,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
             "-threads", str(max(1,min(8,int(os.getenv("FFMPEG_THREADS") or "2")))),
             "-pix_fmt", "yuv420p",
+            '-g',str(fps*2),
         ]
         vf = self._build_vf(chrome_height)
         if vf:
@@ -2228,6 +2290,7 @@ class ZoomRecorder:
             # of once at the end. A killed ffmpeg (container stop, crash, OOM)
             # then leaves a playable file, not one without a moov atom.
             "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+            '-frag_duration','2000000','-flush_packets','1',
             output,
         ]
         log_path = Path(output).parent / ".ffmpeg.log"
@@ -2243,6 +2306,8 @@ class ZoomRecorder:
     def _stop_ffmpeg(self) -> None:
         if not self._ffmpeg:
             return
+        if self._record_start_time is not None:
+            self._capture_stopped_at=time.monotonic()
         if self._ffmpeg.poll() is None:
             try:
                 self._ffmpeg.stdin.write(b"q")

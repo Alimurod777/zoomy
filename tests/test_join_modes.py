@@ -5,7 +5,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock,patch
+from unittest.mock import AsyncMock,Mock,patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'bot'))
 from join_modes import mode_for,set_mode
@@ -36,7 +36,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         self.rec._choose_join_target=AsyncMock(return_value=(URL,False))
         self.contexts=[]
         async def context(**kwargs):
-            obj=SimpleNamespace(new_page=AsyncMock(return_value=SimpleNamespace()),close=AsyncMock())
+            obj=SimpleNamespace(new_page=AsyncMock(return_value=Mock()),close=AsyncMock())
             self.contexts.append((obj,kwargs))
             return obj
         self.browser=SimpleNamespace(new_context=AsyncMock(side_effect=context))

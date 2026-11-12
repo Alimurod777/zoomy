@@ -41,6 +41,7 @@ from join_modes import MODES, mode_for, set_mode
 
 from recorder import ZoomRecorder, _display_pool, SILENT_SNOOZE_SECS, BREAKOUT_AUTOJOIN_SECS, log_zoom_url
 from store import RecordingSession, SessionStore
+from live_panel import RecordingPanel
 
 
 def _setup_logging() -> None:
@@ -1313,6 +1314,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
     silence_msg_ids: list[int] = []
 
     async def on_started(filename: str) -> None:
+        await progress_panel.start()
         folder = Path(filename).parent.name
         await bot.send_message(
             chat_id,
@@ -1323,6 +1325,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
             await _send_peek(session, chat_id, bot)
 
     async def on_stopped(filename: str, duration: str, size: str, auto_ended: bool = False) -> None:
+        await progress_panel.finish()
         folder = Path(filename).parent.name
         if _shutting_down:
             # The process is about to exit, so the transcription queue and the
@@ -1379,6 +1382,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
             _spawn_background(_telegram_upload_task(bot, chat_id, Path(filename)))
 
     async def on_error(msg: str) -> None:
+        await progress_panel.finish(error=msg)
         await bot.send_message(chat_id, f"Session {session_num} error: {msg}")
 
     async def on_dialog(dialog_text: str) -> None:
@@ -1500,6 +1504,8 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
         on_breakout_result=on_breakout_result,
     )
 
+    progress_panel = RecordingPanel(bot, chat_id, session_num, recorder)
+
     async def _hourly_warning() -> None:
         while recorder.is_recording:
             await asyncio.sleep(3600)
@@ -1521,9 +1527,11 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
     async def run() -> None:
         warning_task = asyncio.create_task(_hourly_warning())
         try:
+            await progress_panel.start()
             await recorder.record(url)
         finally:
             warning_task.cancel()
+            await progress_panel.finish()
             try:
                 await _display_pool.release(display_num)
             except Exception:
@@ -1536,7 +1544,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
     recorder.is_recording = True  # /stop and duplicate protection include admission wait.
     task = asyncio.create_task(run())
     task.add_done_callback(_on_task_done)
-    store.add(user_id, RecordingSession(session_num, url, recorder, task, display_num))
+    store.add(user_id, RecordingSession(session_num, url, recorder, task, display_num, panel=progress_panel))
 
 
 # ── Scheduled recording runner ────────────────────────────────────────────────
@@ -1823,8 +1831,8 @@ async def _send_peek(session: RecordingSession, chat_id: int, bot):
             if vf:
                 command += ["-vf", vf]
         command += ["-vframes", "1", "-q:v", "5", str(tmp_path)]
-        result = subprocess.run(
-            command,
+        result = await asyncio.to_thread(
+            subprocess.run, command,
             capture_output=True,
             timeout=10,
         )
@@ -1850,6 +1858,19 @@ async def _send_peek(session: RecordingSession, chat_id: int, bot):
     finally:
         tmp_path.unlink(missing_ok=True)
     return None
+
+
+async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text('Unauthorized.')
+        return
+    sessions = store.active(update.effective_user.id)
+    if not sessions:
+        await update.message.reply_text('Faol yozuv yo‘q.')
+        return
+    for session in sessions:
+        if session.panel:
+            await session.panel.show()
 
 
 async def cmd_peek(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3398,6 +3419,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── main ──────────────────────────────────────────────────────────────────────
 
 _HELP_TEXT = (
+    "/panel — yozuv vaqti va MB hajmi (har 5 soniya)\n"
     "🎙 <b>Zoomy — Zoom Meeting Recorder</b>\n\n"
     "Send /record followed by a Zoom link or Meeting ID.\n"
     "Then choose a name and start now or schedule in WIB (UTC+7).\n\n"
@@ -3720,6 +3742,7 @@ def main() -> None:
     app.add_handler(CommandHandler("record",        cmd_record))
     app.add_handler(CommandHandler("stop",          cmd_stop))
     app.add_handler(CommandHandler("peek",          cmd_peek))
+    app.add_handler(CommandHandler("panel",         cmd_panel))
     app.add_handler(CommandHandler("schedule",      cmd_schedule))
     app.add_handler(CommandHandler("status",        cmd_status))
     app.add_handler(CommandHandler("history",       cmd_history))

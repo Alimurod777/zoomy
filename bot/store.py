@@ -12,6 +12,7 @@ class RecordingSession:
     recorder: ZoomRecorder
     task: asyncio.Task
     display_num: int
+    panel: object | None = None
 
 
 class SessionStore:

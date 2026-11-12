@@ -444,6 +444,34 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, timeout=1)
             self.assertLess(asyncio.get_running_loop().time() - started, 1)
 
+    async def test_record_launch_owns_and_finishes_one_live_panel(self):
+        async def record(recorder, url):
+            recorder._record_start_time = asyncio.get_running_loop().time()
+            recorder.output_path = Path('test-meeting.mp4')
+            await recorder.on_started(str(recorder.output_path))
+            recorder.is_recording = False
+            await recorder.on_stopped(str(recorder.output_path), '1s', '1 MB')
+        pool = types.SimpleNamespace(acquire=AsyncMock(return_value=(99, ':99', 'test.monitor')),
+                                     release=AsyncMock())
+        with patch.object(bot, '_display_pool', pool), \
+             patch.object(bot.ZoomRecorder, 'record', record), \
+             patch.object(bot, '_send_peek', AsyncMock()), \
+             patch.object(bot, '_transcribe_timeout', AsyncMock()), \
+             patch.object(bot.filebrowser_mod, 'is_configured', return_value=False), \
+             patch.object(bot.youtube_mod, 'is_configured', return_value=False), \
+             patch.object(bot.telegram_upload_mod, 'is_configured', return_value=False):
+            await bot._launch_recording(7, 7, self.context.bot,
+                                       {'url': 'https://zoom.us/j/123456789'})
+            session = bot.store._sessions[7][0]
+            await session.task
+        self.assertIsNotNone(session.panel.message_id)
+        self.assertIsNone(session.panel.task)
+        pool.release.assert_awaited_once_with(99)
+        panel_messages = [call for call in self.context.bot.send_message.call_args_list
+                          if '<b>Yozuv — Session' in str(call)]
+        self.assertEqual(len(panel_messages), 1)
+        self.assertIn('Tugadi', self.context.bot.edit_message_text.call_args.kwargs['text'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,5 +1,19 @@
 # Zoomy — Alwaysdata’da ishlatish
 
+Yozuv paneli Telegram’da bitta xabarni har 5 soniyada yangilaydi: yozilgan
+davomiylik, joriy fayl hajmi (MB = 1 000 000 bayt), manba va to‘xtatish tugmasi.
+Kirishni kutish va pauza vaqti yozuv davomiyligiga qo‘shilmaydi. Yakunlash
+paytida hisoblagich to‘xtaydi; Desktop videoni tozalasa yakuniy hajm o‘zgarishi
+mumkin. Telegram cheklovi yoki tarmoq uzilishi yangilanishni kechiktirishi mumkin.
+Panel o‘chirilgan bo‘lsa `/panel` bilan qayta oching. Bu Telegram xabari videoga
+yozilmaydi. Efirning o‘zidagi slayd yoki matn esa saqlanadi.
+
+Brauzer tab’i qulab tushsa (`Aw, Snap!` / `Target crashed`), yozuv pauzaga
+o‘tadi va eski tab o‘rniga yangi tabda qayta ulanishga urinadi. Oldingi yozilgan
+qism saqlanadi. Qayta ulanish muvaffaqiyatsiz bo‘lsa xato xabari yuboriladi;
+qulagan sahifa cheksiz yozilmaydi. Chromium nima sababdan o‘ldirilganini
+aniqlash uchun hostingning resurs ko‘rsatkichlarini ham tekshirish kerak.
+
 ## Yozuv ko‘rinishi
 
 `ZOOM_CLEAN_RECORDING=true` standart holat. Ekran ulashilganda Zoom’ning

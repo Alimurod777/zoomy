@@ -56,5 +56,6 @@ SNAPSHOT_JS = r'''() => {
     const app_launch=!admitted&&!browser_available&&controls.some(el=>
         visible(el)&&(launchLabels.test((el.innerText||el.getAttribute('aria-label')||'').trim())
             || /^(zoommtg|zoomus):\/\//i.test(el.getAttribute('href')||'')));
-    return {text:admitted&&!waiting_room?notices:(document.body.innerText||''),admitted,waiting_room,app_launch,browser_available};
+    const media_mode=window.__zoomyRecordingView?.status()?.mode||null;
+    return {text:admitted&&!waiting_room?notices:(document.body.innerText||''),admitted,waiting_room,app_launch,browser_available,media_mode};
 }'''
