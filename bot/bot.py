@@ -739,6 +739,9 @@ async def _auto_start_recording(user_id: int, chat_id: int, bot) -> None:
             store.pop_pending(user_id)
             await bot.send_message(chat_id, "Bu konferensiya allaqachon kutilyapti yoki yozilyapti. /ongoing yoki /stop.")
             return
+    if _needs_passcode_prompt(pending):
+        await _ask_meeting_password(user_id, bot)
+        return
     store.update_pending(user_id, use_profile_name=True, prefix=None)
     await bot.send_message(chat_id,
         "Havola qabul qilindi. Profil ismi va yozuv nomi avtomatik tanlanadi.\n"

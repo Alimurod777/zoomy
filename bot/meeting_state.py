@@ -10,7 +10,7 @@ def classify_meeting(snapshot):
     browser_available = snapshot.get('browser_available', False)
     phrases = {
         "removed": ("removed from this meeting", "you have been removed", "host has denied", "not allowed to rejoin"),
-        "ended": ("been ended by host", "been ended by the host", "meeting has ended", "meeting is ended", "host has ended"),
+        "ended": ("been ended by host", "been ended by the host", "meeting has ended", "meeting is ended", "host has ended", "the host ended this meeting"),
         "app_required": ("join this meeting using the zoom desktop", "only available in the zoom desktop", "not supported in the web client", "meeting requires the zoom app", "joining this meeting from a web browser is not allowed", "web client is disabled for this meeting"),
         "auth_required": ("sign in to join this meeting", "sign in to join the meeting", "only authenticated users can join",
                           "this meeting requires authentication", "meeting is for authorized participants only",

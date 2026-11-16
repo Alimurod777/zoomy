@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 import sys
@@ -38,6 +39,25 @@ class DesktopStateTests(unittest.TestCase):
         self.assertEqual(native_state([], meeting_window=True), 'connecting')
         self.assertEqual(native_state([('Join a meeting Sign in',0,0)],False,True),'ended')
 
+    def test_welcome_screen_overrides_reused_meeting_window(self):
+        for join in ('Join a meeting', 'Jain a meeting'):
+            lines=[('Zoom Workplace',900,400),('Sign in',900,500),
+                   (join,900,600),('Sign up',900,700)]
+            self.assertEqual(native_state(lines,True,True),'ended')
+            self.assertEqual(native_state(lines,True,False),'connecting')
+        self.assertEqual(native_state([('Sign in',900,500)],True,True),'admitted')
+
+    def test_meeting_passcode_prompt_is_distinct_from_invalid_passcode(self):
+        self.assertEqual(native_state([('Enter meeting passcode',890,470)]),'passcode_required')
+        self.assertEqual(native_state([('Enter meeting passcode Incorrect meeting passcode',890,470)]),'passcode')
+
+    def test_audio_join_checkbox_and_signin_are_never_meeting_end(self):
+        lines=[('Sign in',1300,230),('Join with Computer Audio',960,565),
+               ('Automatically join audio by computer when joining a meeting',950,770),
+               ('Participants',850,980),('Share',1100,980),('Leave',1500,980)]
+        self.assertEqual(native_state(lines,False,True),'admitted')
+        self.assertEqual(native_state(lines[:3],False,True),'connecting')
+
     def test_actual_controls_confirm_admission(self):
         self.assertEqual(native_state([('Participants Share Leave', 0, 0)]), 'admitted')
         self.assertEqual(native_state([], True, True), 'admitted')
@@ -50,12 +70,25 @@ class DesktopStateTests(unittest.TestCase):
                 ('Invalid meeting ID', 'invalid')]:
             self.assertEqual(native_state([(text,0,0)]), expected)
 
+    def test_waiting_card_with_dropped_ocr_prefix_keeps_waiting(self):
+        lines=[('Host has joined.',730,360),("t them know you're here.",950,360),
+               ('Test Speaker and Mic',800,400)]
+        self.assertEqual(native_state(lines),'waiting_room')
+        self.assertEqual(native_state(lines,True,True),'waiting_room')
+        self.assertEqual(native_state([('Host has joined.',730,360)]),'connecting')
+
     def test_ocr_ignores_uncertain_words_and_preserves_click_position(self):
         tsv = 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n'
         tsv += '5\t1\t1\t1\t1\t1\t10\t20\t40\t10\t95\tJoin\n'
         tsv += '5\t1\t1\t1\t1\t2\t60\t20\t60\t10\t96\tAudio\n'
         tsv += '5\t1\t2\t1\t1\t1\t0\t0\t9\t9\t10\tNoise\n'
         self.assertEqual(ocr_lines(tsv), [('Join Audio',65,25)])
+
+    def test_ocr_quote_does_not_swallow_subsequent_controls(self):
+        tsv='block_num\tpar_num\tline_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+        tsv+='1\t1\t1\t10\t10\t20\t10\t95\t"noise\n'
+        tsv+='2\t1\t1\t10\t100\t40\t10\t95\tJoin\n'
+        self.assertEqual(ocr_lines(tsv),[('"noise',20,15),('Join',30,105)])
 
     def test_only_auto_mode_requests_native_fallback(self):
         recorder=ZoomRecorder()
@@ -72,6 +105,75 @@ class NativeViewTests(unittest.IsolatedAsyncioTestCase):
         self.app.admitted=True
         self.app.command=AsyncMock(return_value=b'')
 
+    async def test_passcode_outline_is_detected_and_secret_uses_stdin(self):
+        import io
+        from PIL import Image, ImageDraw
+        image=Image.new('RGB',(1920,1200),'white')
+        ImageDraw.Draw(image).rectangle((740,511,1181,550),outline=(0,112,243),width=1)
+        buffer=io.BytesIO()
+        image.save(buffer,format='PNG')
+        self.app._last_screen_png=buffer.getvalue()
+        self.app.lines=[('Enter meeting passcode',890,471)]
+        self.assertTrue(await self.app.enter_passcode('private-passcode'))
+        self.app.command.assert_any_await('xdotool','mousemove','961','531','click','1',check=True)
+        self.app.command.assert_any_await('xdotool','type','--clearmodifiers','--file','-',input=b'private-passcode',check=True)
+        self.assertFalse(any('private-passcode' in call.args for call in self.app.command.await_args_list))
+
+    async def test_passcode_never_types_into_an_unconfirmed_window(self):
+        self.app.lines=[('Sign in',890,471)]
+        self.assertFalse(await self.app.enter_passcode('private-passcode'))
+        self.app.command.assert_not_awaited()
+
+    async def test_audio_routing_checks_only_this_displays_zoom_streams(self):
+        sinks=[{'index':7,'name':'virtual_85'}]
+        own={'sink':7,'properties':{'application.process.binary':'zoom','window.x11.display':':85'}}
+        other={'sink':0,'properties':{'application.process.binary':'zoom','window.x11.display':':99'}}
+        self.app.command=AsyncMock(side_effect=[json.dumps(sinks).encode(),json.dumps([own,other]).encode()])
+        self.assertTrue(await self.app.audio_output_ready())
+        self.app.command=AsyncMock(side_effect=[json.dumps(sinks).encode(),json.dumps([other]).encode()])
+        self.assertFalse(await self.app.audio_output_ready())
+
+    async def test_zoom_speaker_menu_selects_session_sink(self):
+        self.app.meeting_window_id='4096'
+        self.app.audio_output_ready=AsyncMock(side_effect=[False,True])
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','getwindowgeometry'):
+                return b'X=0\nY=0\nWIDTH=1920\nHEIGHT=1200'
+            return b''
+        screens=[[('Audio',50,1184)],[('Select a speaker',80,709),('virtual_85',100,778)]]
+        async def read(**kwargs):
+            self.app.lines=screens.pop(0)
+        self.app.command=AsyncMock(side_effect=command)
+        self.app.read_screen=AsyncMock(side_effect=read)
+        with patch('zoom_desktop.asyncio.sleep',new=AsyncMock()):
+            self.assertTrue(await self.app.ensure_audio_output())
+        self.app.command.assert_any_await('xdotool','mousemove','78','1158','click','1')
+        self.app.command.assert_any_await('xdotool','mousemove','100','778','click','1')
+        self.assertFalse(any('set-default-sink' in call.args for call in self.app.command.await_args_list))
+
+    async def test_prepare_retries_audio_after_admission_recreates_windows(self):
+        self.app.join_computer_audio=AsyncMock(return_value=True)
+        self.app.ensure_fullscreen=AsyncMock()
+        self.app.close_auxiliary_windows=AsyncMock()
+        self.app.clean_shared_view=AsyncMock()
+        self.app.ensure_audio_output=AsyncMock(side_effect=[False,True])
+        self.app.snapshot=AsyncMock(return_value='admitted')
+        self.app.stop_event.wait=AsyncMock(side_effect=asyncio.TimeoutError())
+        with patch('zoom_desktop.asyncio.sleep',new=AsyncMock()):
+            await self.app.prepare()
+        self.assertEqual(self.app.ensure_audio_output.await_count,2)
+        self.app.snapshot.assert_awaited_once()
+        self.assertEqual(self.app.ensure_fullscreen.await_count,2)
+
+    async def test_unverified_speaker_blocks_starting_silent_recording(self):
+        self.app.join_computer_audio=AsyncMock(return_value=True)
+        self.app.ensure_fullscreen=AsyncMock()
+        self.app.close_auxiliary_windows=AsyncMock()
+        self.app.clean_shared_view=AsyncMock()
+        self.app.ensure_audio_output=AsyncMock(return_value=False)
+        with self.assertRaisesRegex(RuntimeError,'ovozsiz yozuv'):
+            await self.app.prepare()
+
     async def test_pointer_parks_away_from_toolbar_edges(self):
         self.app.lines=[('Mute',25,1150)]
         self.assertTrue(await self.app.click_label('Mute'))
@@ -83,7 +185,10 @@ class NativeViewTests(unittest.IsolatedAsyncioTestCase):
         with patch('zoom_desktop.shutil.which',return_value='/runtime/wmctrl'):
             await self.app.ensure_fullscreen()
             await self.app.ensure_fullscreen()
-        self.app.command.assert_awaited_once_with('wmctrl','-i','-r','0x1000','-b','add,fullscreen')
+        self.app.command.assert_any_await('wmctrl','-i','-r','0x1000','-b','add,fullscreen')
+        self.app.command.assert_any_await('xdotool','windowactivate','4096')
+        self.app.command.assert_any_await('xdotool','windowraise','4096')
+        self.assertEqual(self.app.command.await_count,3)
 
     async def test_hide_video_panel_uses_only_opened_menu(self):
         self.app.lines=[('View Options',900,40)]
@@ -114,7 +219,8 @@ class NativeViewTests(unittest.IsolatedAsyncioTestCase):
         self.app.command.assert_not_awaited()
 
     async def test_prepare_does_not_use_windows_shortcut_or_change_capture(self):
-        self.app.stop_event.set()  # skip toolbar-settle wait
+        self.app.stop_event.wait=AsyncMock(side_effect=asyncio.TimeoutError())
+        self.app.ensure_audio_output=AsyncMock(return_value=True)  # skip toolbar-settle wait
         self.app.ensure_fullscreen=AsyncMock()
         self.app.clean_shared_view=AsyncMock()
         self.app.lines=[('Unmute',50,1150),('Start Video',160,1150)]
@@ -146,6 +252,14 @@ class NativeViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any('597' in call.args for call in self.app.command.await_args_list))
         self.assertFalse(self.app.audio_dialog_open)
 
+    async def test_visible_audio_window_blocks_recording_even_when_ocr_misses_text(self):
+        self.app.lines=[]
+        self.app.read_screen=AsyncMock()
+        self.app.audio_dialog_visible=AsyncMock(return_value=True)
+        self.assertFalse(await self.app.join_computer_audio())
+        with self.assertRaisesRegex(RuntimeError,'audiosiga'):
+            await self.app.prepare()
+
     async def test_recording_is_blocked_if_audio_dialog_does_not_disappear(self):
         self.app.read_screen=AsyncMock()
         self.app.lines=[('Join with Computer Audio',960,564),('Test speaker and microphone',960,597)]
@@ -167,7 +281,59 @@ class NativeViewTests(unittest.IsolatedAsyncioTestCase):
         self.app.command.assert_any_await('wmctrl','-i','-c','0x1001')
         self.assertEqual(sum(call.args[:1]==('wmctrl',) for call in self.app.command.await_args_list),1)
 
-    async def test_modern_zoom_workplace_meeting_gets_the_largest_owned_window(self):
+    async def test_recreated_window_is_found_by_title_when_class_search_is_empty(self):
+        self.app.meeting_window_id='4096'
+        self.app._fullscreen_window_id='4096'
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','search'):
+                return b'4097' if '--name' in args else b''
+            if args[:2]==('xdotool','getwindowname'):
+                return b'Meeting'
+            return b''
+        async def read(**kwargs):
+            self.app.lines=[('Participants Share Leave',900,1175)]
+        self.app.command=AsyncMock(side_effect=command)
+        self.app.read_screen=AsyncMock(side_effect=read)
+        self.assertEqual(await self.app.snapshot(),'admitted')
+        self.assertEqual(self.app.meeting_window_id,'4097')
+        self.assertIsNone(self.app._fullscreen_window_id)
+
+    async def test_controls_without_a_visible_window_do_not_start_recording(self):
+        self.app.admitted=False
+        self.app.meeting_window_id='4096'
+        self.app.command=AsyncMock(return_value=b'')
+        async def read(**kwargs):
+            self.app.lines=[('Participants Share Leave',900,1175)]
+        self.app.read_screen=AsyncMock(side_effect=read)
+        self.assertEqual(await self.app.snapshot(),'connecting')
+        self.assertIsNone(self.app.meeting_window_id)
+        self.assertFalse(self.app.admitted)
+
+    async def test_generic_meeting_title_is_found_behind_home(self):
+        self.app.admitted=False
+        self.app.meeting_window_id=None
+        active=['4096']
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','search'):
+                return b'4096\n4097'
+            if args[:2]==('xdotool','getwindowname'):
+                return b'Meeting' if args[-1]=='4097' else b'Zoom Workplace'
+            if args[:2]==('xdotool','windowactivate'):
+                active[0]=args[-1]
+            if args[:2]==('xdotool','getwindowgeometry'):
+                return b'X=366\nY=200\nWIDTH=1188\nHEIGHT=800'
+            return b''
+        async def read(**kwargs):
+            self.app.lines=([('Participants Share Leave',900,980)] if active[0]=='4097' else
+                            [('Sign in',900,500),('Join a meeting',850,600),('Sign up',1000,600)])
+        self.app.command=AsyncMock(side_effect=command)
+        self.app.read_screen=AsyncMock(side_effect=read)
+        with patch('zoom_desktop.asyncio.sleep',new=AsyncMock()):
+            self.assertEqual(await self.app.snapshot(),'admitted')
+        self.assertEqual(self.app.meeting_window_id,'4097')
+        self.assertEqual(active[0],'4097')
+
+    async def test_modern_zoom_workplace_meeting_uses_visible_controls_instead_of_size(self):
         self.app.meeting_window_id=None
         async def command(*args,**kwargs):
             if args[:2]==('xdotool','search'):
@@ -175,7 +341,7 @@ class NativeViewTests(unittest.IsolatedAsyncioTestCase):
             if args[:2]==('xdotool','getwindowname'):
                 return b'Zoom Workplace'
             if args[:2]==('xdotool','getwindowgeometry'):
-                return b'WIDTH=1920\nHEIGHT=1200' if args[-1]=='4097' else b'WIDTH=1230\nHEIGHT=723'
+                return b'X=0\nY=0\nWIDTH=1920\nHEIGHT=1200' if args[-1]=='4097' else b'X=0\nY=0\nWIDTH=1230\nHEIGHT=723'
             return b''
         self.app.command=AsyncMock(side_effect=command)
         async def read(**kwargs):
@@ -184,6 +350,69 @@ class NativeViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.app.snapshot(),'admitted')
         self.assertEqual(self.app.meeting_window_id,'4097')
         self.assertTrue(self.app.share_seen)
+
+    async def test_workplace_titled_preview_gets_its_join_button_read(self):
+        self.app.admitted=False
+        self.app.meeting_window_id=None
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','search'):
+                return b'4096'
+            if args[:2]==('xdotool','getwindowname'):
+                return b'Zoom Workplace'
+            if args[:2]==('xdotool','getwindowgeometry'):
+                return b'X=350\nY=200\nWIDTH=1200\nHEIGHT=850'
+            return b''
+        async def read(**kwargs):
+            self.app.lines=[('Always show this preview when joining',700,1000)]
+            self.app.preview_join=(1230,1010) if (350,200,1550,1050) in kwargs.get('extra_regions',[]) else None
+        self.app.command=AsyncMock(side_effect=command)
+        self.app.read_screen=AsyncMock(side_effect=read)
+        self.assertEqual(await self.app.snapshot(),'connecting')
+        self.app.command.assert_any_await('xdotool','mousemove','1230','1010','click','1')
+
+    async def test_preview_join_is_clicked_before_other_windows_are_raised(self):
+        self.app.admitted=False
+        self.app.meeting_window_id=None
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','search'):
+                return b'4096\n4097'
+            if args[:2]==('xdotool','getwindowname'):
+                return b'Zoom Workplace'
+            return b''
+        async def read(**kwargs):
+            self.app.lines=[('Video Preview',900,400)]
+            self.app.preview_join=(1100,800)
+        self.app.command=AsyncMock(side_effect=command)
+        self.app.read_screen=AsyncMock(side_effect=read)
+        self.assertEqual(await self.app.snapshot(),'connecting')
+        self.app.command.assert_any_await('xdotool','mousemove','1100','800','click','1')
+        self.assertFalse(any(call.args[:2] in {('xdotool','windowactivate'),('xdotool','windowraise')}
+                             for call in self.app.command.await_args_list))
+
+    async def test_home_covering_smaller_meeting_is_replaced_by_actual_meeting(self):
+        home=[('Sign in',900,500),('Join a meeting',850,600),('Sign up',1000,600)]
+        meeting=[('Participants Share Leave',900,980)]
+        self.app.meeting_window_id='4096'  # old size-based choice picked Home
+        active=['4096']
+        async def command(*args,**kwargs):
+            if args[:2]==('xdotool','search'):
+                return b'4096\n4097'
+            if args[:2]==('xdotool','getwindowname'):
+                return b'Zoom Workplace'
+            if args[:2]==('xdotool','getwindowgeometry'):
+                return b'X=345\nY=238\nWIDTH=1230\nHEIGHT=723' if args[-1]=='4096' else b'X=366\nY=200\nWIDTH=1188\nHEIGHT=800'
+            if args[:2]==('xdotool','windowactivate'):
+                active[0]=args[-1]
+            return b''
+        async def read(**kwargs):
+            self.app.lines=list(home if active[0]=='4096' else meeting)
+        self.app.command=AsyncMock(side_effect=command)
+        self.app.read_screen=AsyncMock(side_effect=read)
+        with patch('zoom_desktop.asyncio.sleep',new=AsyncMock()):
+            self.assertEqual(await self.app.snapshot(),'admitted')
+        self.assertEqual(self.app.meeting_window_id,'4097')
+        self.assertEqual(active[0],'4097')
+        self.assertFalse(any(call.args[:2]==('wmctrl','-c') for call in self.app.command.await_args_list))
 
     async def test_audio_popup_is_read_alongside_margins_without_reading_shared_slide(self):
         self.app.meeting_window_id='4096'
@@ -203,6 +432,18 @@ class NativeViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.app.snapshot(),'admitted')
         self.app.read_screen.assert_awaited_once_with(margins_only=True,extra_regions=[(674,380,1246,802)])
         self.app.join_computer_audio.assert_awaited_once_with(refresh=False)
+
+    async def test_home_probe_reads_center_when_meeting_window_is_reused(self):
+        import io
+        from PIL import Image
+        buffer=io.BytesIO()
+        Image.new('RGB',(1920,1200),'white').save(buffer,format='PNG')
+        tsv='level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+        for i,label in enumerate(('Sign in','Jain a meeting','Sign up')):
+            tsv+=f'5\t1\t{i+1}\t1\t1\t1\t800\t{400+i*100}\t200\t30\t95\t{label}\n'
+        self.app.command=AsyncMock(side_effect=[buffer.getvalue(),b'',tsv.encode()])
+        await self.app.read_screen(margins_only=True)
+        self.assertEqual(native_state(self.app.lines,True,True),'ended')
 
     async def test_share_switch_rechecks_hide_panel_even_in_the_same_window(self):
         self.app.meeting_window_id='4096'
@@ -277,6 +518,20 @@ class AudioButtonGeometryTests(unittest.TestCase):
 
 
 class DesktopFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_cleanup_selects_camera_or_share_view(self):
+        for shared in (False,True):
+            rec=ZoomRecorder()
+            rec.output_path=Path('/tmp/test-camera-choice.mp4')
+            rec._native_shared_seen=shared
+            process=SimpleNamespace(returncode=0,communicate=AsyncMock(return_value=(b'cleaned',b'')))
+            launch=AsyncMock(return_value=process)
+            with patch.dict(os.environ,ZOOM_NATIVE_CLEAN_VIDEO='true'), \
+                 patch('recorder.asyncio.create_subprocess_exec',new=launch):
+                await rec._clean_native_video()
+            args=launch.call_args.args
+            self.assertEqual('--camera-view' in args,not shared)
+            self.assertNotIn('--keep-full-view',args)
+
     async def test_terminal_reference_is_private_and_deleted_after_worker(self):
         rec=ZoomRecorder()
         with tempfile.TemporaryDirectory() as folder:
@@ -393,6 +648,16 @@ class DesktopFlowTests(unittest.IsolatedAsyncioTestCase):
         native.open.assert_awaited_once_with(URL,rec.guest_name)
         native.control_link.assert_not_called()
 
+    async def test_guest_join_uses_saved_account_name(self):
+        rec=ZoomRecorder(use_profile_name=True)
+        rec._native_guest=True
+        native=Mock(open=AsyncMock(),close=AsyncMock(),snapshot=AsyncMock(return_value='ended'))
+        saved=SimpleNamespace(configured=True,load=AsyncMock(return_value={
+            'profile':{'display_name':'Real Account Name'}}))
+        with patch('zoom_desktop.NativeZoom',return_value=native), patch('recorder.auth_store',saved):
+            await rec._record_native(URL)
+        native.open.assert_awaited_once_with(URL,'Real Account Name')
+
     async def test_host_and_waiting_room_never_prompt_for_login(self):
         rec=ZoomRecorder(user_id=999,use_profile_name=False,on_waiting=AsyncMock())
         clock=SimpleNamespace(now=0)
@@ -406,6 +671,43 @@ class DesktopFlowTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(recorder_module,'time',SimpleNamespace(monotonic=lambda:clock.now)):
             await rec._record_native(URL)
         native.control_link.assert_not_awaited()
+
+    async def test_waiting_for_host_admission_does_not_hit_60_second_setup_timeout(self):
+        rec=ZoomRecorder(use_profile_name=False,on_waiting=AsyncMock())
+        clock=SimpleNamespace(now=0)
+        lines=[('Host has joined.',730,360),("t them know you're here.",950,360)]
+        native=Mock(open=AsyncMock(),close=AsyncMock(),control_link=AsyncMock(),
+                    snapshot=AsyncMock(side_effect=[native_state(lines)]*5+['ended']))
+        async def delay(seconds):
+            clock.now+=20
+            return False
+        rec._wait_or_stop=AsyncMock(side_effect=delay)
+        with patch('zoom_desktop.NativeZoom',return_value=native), \
+             patch.object(recorder_module,'time',SimpleNamespace(monotonic=lambda:clock.now)):
+            await rec._record_native(URL)
+        self.assertGreater(clock.now,60)
+        self.assertIsNone(rec.output_path)
+        native.control_link.assert_not_awaited()
+        native.close.assert_awaited_once()
+
+    async def test_native_uses_separately_supplied_meeting_passcode(self):
+        rec=ZoomRecorder(use_profile_name=False,meeting_password='private-passcode')
+        native=Mock(open=AsyncMock(),close=AsyncMock(),
+                    enter_passcode=AsyncMock(return_value=True),
+                    snapshot=AsyncMock(side_effect=['passcode_required','waiting_room','ended']))
+        rec._wait_or_stop=AsyncMock(return_value=False)
+        with patch('zoom_desktop.NativeZoom',return_value=native):
+            await rec._record_native(URL)
+        native.enter_passcode.assert_awaited_once_with('private-passcode')
+        self.assertIsNone(rec.output_path)
+
+    async def test_missing_passcode_reports_the_real_requirement(self):
+        rec=ZoomRecorder(use_profile_name=False)
+        native=Mock(open=AsyncMock(),close=AsyncMock(),snapshot=AsyncMock(return_value='passcode_required'))
+        with patch('zoom_desktop.NativeZoom',return_value=native):
+            with self.assertRaisesRegex(recorder_module.MeetingJoinError,'uchrashuv parolini'):
+                await rec._record_native('https://example.zoom.us/j/12345678900')
+        native.close.assert_awaited_once()
 
     async def test_native_cancel_does_not_open_an_app(self):
         rec=ZoomRecorder()

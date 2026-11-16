@@ -750,6 +750,7 @@ class ZoomRecorder:
                 logger.info("Switching to native Zoom Desktop (display=%s)", self.display)
                 await self._record_desktop(url)
             except Exception as exc:
+                logger.exception('Native Desktop fallback failed')
                 self._session_errored = self._session_errored or self.output_path is None
                 if self.on_error:
                     await self.on_error(str(exc))
@@ -766,7 +767,7 @@ class ZoomRecorder:
             # Concat can be lengthy for big files — keep the loop responsive.
             await asyncio.to_thread(self._finalize_segments)
             if (self.output_path and self.output_path.is_file() and not self._session_errored
-                    and (self._native_terminal_reference or (self._native_shared_seen
+                    and (self._native_terminal_reference or (self._media_mode=='desktop'
                     and os.getenv('ZOOM_NATIVE_CLEAN_VIDEO', 'true').lower() in {'true','1','yes'}))):
                 await self._clean_native_video()
                 if self._native_final_duration is not None:
@@ -1139,13 +1140,27 @@ class ZoomRecorder:
         logger.info("Recording resumed — new segment %s", seg.name)
 
     def _finalize_segments(self) -> None:
-        """Concatenate paused segments into the single output file.
-
-        No-op when the recording was never paused (one continuous segment
-        already sits at output_path).
-        """
+        """Finalize fragmented captures as indexed MP4 for seeking/streaming."""
         parts = [p for p in self._segments if p.exists() and p.stat().st_size > 0]
-        if len(parts) <= 1 or not self.output_path:
+        if not parts or not self.output_path:
+            return
+        if len(parts) == 1:
+            tmp_out = self.output_path.with_suffix('.finalizing.mp4')
+            try:
+                result = subprocess.run(
+                    ['ffmpeg', '-y', '-loglevel', 'warning', '-i', str(parts[0]),
+                     '-map', '0:v:0', '-map', '0:a?', '-c', 'copy',
+                     '-movflags', '+faststart', str(tmp_out)],
+                    capture_output=True, timeout=600)
+                if result.returncode != 0 or not tmp_out.exists() or not tmp_out.stat().st_size:
+                    logger.error('MP4 finalization failed; original recording retained')
+                    return
+                os.replace(tmp_out, self.output_path)
+                self._segments = [self.output_path]
+            except Exception:
+                logger.exception('MP4 finalization failed; original recording retained')
+            finally:
+                tmp_out.unlink(missing_ok=True)
             return
         list_path = self.output_path.parent / ".concat.txt"
         tmp_out = self.output_path.with_name(f"{self.recording_prefix}.merged.mp4")
@@ -1676,7 +1691,7 @@ class ZoomRecorder:
         self._media_mode='desktop'
         if self._stop_event.is_set():
             return
-        if self.use_profile_name and not self._native_guest:
+        if self.use_profile_name:
             try:
                 state = await auth_store.load() if auth_store.configured else _load_zoom_state()
                 if isinstance(state, str):
@@ -1690,6 +1705,8 @@ class ZoomRecorder:
         native = (NativeZoom(self.display,self.sink_name,self._stop_event,guest=True) if self._native_guest
                   else NativeZoom(self.display,self.sink_name,self._stop_event,account=True) if self._native_require_auth
                   else NativeZoom(self.display, self.sink_name, self._stop_event))
+        logger.info('Native passcode sources: invitation=%s, separately_supplied=%s',
+                    bool(parse_zoom_url(url)[1]), bool(self.meeting_password))
         try:
             opening=(native.open(url,self.guest_name,require_auth=True) if self._native_require_auth
                      else native.open(url,self.guest_name))
@@ -1706,12 +1723,27 @@ class ZoomRecorder:
             paused_for_connection = False
             unknown_since = time.monotonic()
             auth_since = None
+            passcode_submitted_at = None
             while not self._stop_event.is_set():
                 state = await self._native_snapshot(native)
                 if state is None:
                     break
                 if self._stop_event.is_set():
                     break
+                if state == 'passcode_required':
+                    if not self.meeting_password:
+                        if parse_zoom_url(url)[1]:
+                            raise MeetingJoinError('Havolada pwd bor, lekin Zoom baribir uchrashuv parolini so‘rayapti. Hostdan yangi taklif havolasi yoki alohida kirish parolini oling.')
+                        raise MeetingJoinError('Zoom uchrashuv parolini so‘rayapti. /record uchun pwd bor to‘liq havolani yuboring yoki parolni alohida kiriting.')
+                    if passcode_submitted_at is None:
+                        if not await native.enter_passcode(self.meeting_password):
+                            raise MeetingJoinError('Zoom parol maydoni aniqlanmadi; Desktop boshqaruv oynasida parolni kiriting.')
+                        passcode_submitted_at = time.monotonic()
+                        unknown_since = time.monotonic()
+                        logger.info('Native meeting passcode submitted (value redacted)')
+                    elif time.monotonic()-passcode_submitted_at >= 10:
+                        raise MeetingJoinError('Zoom kiritilgan uchrashuv parolini qabul qilmadi. Parolni yoki taklif havolasini tekshiring.')
+                    state = 'connecting'
                 if state=='auth_required':
                     if self._native_guest:
                         raise NativeAuthRequired('Desktop akkaunt talab qildi')
@@ -1753,6 +1785,9 @@ class ZoomRecorder:
                         if self.on_started:
                             await self.on_started(str(self.output_path))
                     elif paused_for_connection:
+                        await native.prepare()
+                        if self._stop_event.is_set():
+                            break
                         self._resume_recording()
                         paused_for_connection = False
                     try:
@@ -1808,7 +1843,8 @@ class ZoomRecorder:
         try:
             result=await self._native_operation(native.snapshot(),25)
             return None if result is _NATIVE_STOPPED else result
-        except (asyncio.TimeoutError,OSError):
+        except (asyncio.TimeoutError,OSError) as exc:
+            logger.warning('Desktop screen inspection failed: %s',type(exc).__name__)
             return 'disconnected'
 
     async def _native_operation(self,awaitable,timeout):
@@ -1832,8 +1868,10 @@ class ZoomRecorder:
         worker = Path(__file__).with_name('native_video.py')
         terminal_path = None
         options = []
-        if not self._native_shared_seen or os.getenv('ZOOM_NATIVE_CLEAN_VIDEO','true').lower() not in {'true','1','yes'}:
+        if os.getenv('ZOOM_NATIVE_CLEAN_VIDEO','true').lower() not in {'true','1','yes'}:
             options.append('--keep-full-view')
+        elif not self._native_shared_seen:
+            options.append('--camera-view')
         if self.on_waiting:
             try:
                 await self.on_waiting('Yozuv tugadi. Asosiy ekran maydoni moslashtirilyapti, keyin fayl yuboriladi.')

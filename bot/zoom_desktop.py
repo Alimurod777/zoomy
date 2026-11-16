@@ -4,6 +4,7 @@ from collections import deque
 import csv
 import fcntl
 import io
+import json
 import logging
 import hashlib
 import os
@@ -40,7 +41,7 @@ def native_join_uri(url, name):
 
 def ocr_lines(tsv):
     groups = {}
-    for row in csv.DictReader(io.StringIO(tsv), delimiter='\t'):
+    for row in csv.DictReader(io.StringIO(tsv), delimiter='\t', quoting=csv.QUOTE_NONE):
         try:
             if not row.get('text', '').strip() or float(row['conf']) < 35:
                 continue
@@ -58,13 +59,31 @@ def ocr_lines(tsv):
     return lines
 
 
+def is_home_screen(lines):
+    """Require the standalone welcome controls, including common OCR variants."""
+    labels = {re.sub(r'[^a-z ]', '', label.casefold()).strip() for label, _, _ in lines}
+    return ('sign in' in labels and 'sign up' in labels
+            and bool(labels & {'join a meeting', 'jain a meeting'}))
+
+
 def native_state(lines, meeting_window=False, previously_admitted=False):
+    text = ' '.join(line[0] for line in lines)
+    controls = 'participants' in text.lower() and ('leave' in text.lower() or 'share' in text.lower())
+    if is_home_screen(lines) and not controls:
+        return 'ended' if previously_admitted else 'connecting'
     text = ' '.join(line[0] for line in lines)
     state = classify_meeting(text)
     if state != 'connecting':
         return state
-    lower = text.lower()
-    if (previously_admitted and not meeting_window and 'join' in lower
+    lower = text.lower().replace('’', "'")
+    if 'enter meeting passcode' in lower or 'enter the meeting passcode' in lower:
+        return 'passcode_required'
+    # Linux Workplace's waiting card is OCR'd as separate lines; its
+    # "We've let" prefix is often dropped while the rest stays readable.
+    if ('host has joined' in lower and "them know you're here" in lower):
+        return 'waiting_room'
+    if (previously_admitted and not meeting_window and not controls
+            and re.search(r'\b(?:join|jain) a meeting\b', lower)
             and ('sign in' in lower or 'new meeting' in lower or 'schedule' in lower)):
         return 'ended'
     # A launch/home window or video preview is never proof of admission.
@@ -238,6 +257,7 @@ class NativeZoom:
         self.log = None
         self.admitted = False
         self.mic_module = None
+        self.mic_source_module = None
         self.lines = []
         self.meeting_window_id = None
         self._fullscreen_window_id = None
@@ -265,6 +285,9 @@ class NativeZoom:
         self.audio_dialog_open = False
         self.audio_window_rect = None
         self._last_header_ocr = float('-inf')
+        self._last_home_ocr = float('-inf')
+        self._last_window_probe = float('-inf')
+        self._last_state = None
         self._share_signature = None
         self.terminal_reference = None
         self._last_screen_png = None
@@ -334,7 +357,15 @@ class NativeZoom:
         if not module.strip().isdigit():
             raise RuntimeError('Desktop uchun ovozsiz mikrofon tayyorlanmadi.')
         self.mic_module = module.decode().strip()
-        self.env['PULSE_SOURCE'] = mic+'.monitor'
+        # Expose a regular source: Zoom omits sink-monitor sources from its
+        # microphone list even when PULSE_SOURCE points to one.
+        source = await self.command('pactl','load-module','module-remap-source',
+                                    'master='+mic+'.monitor','source_name='+mic+'_source',
+                                    'source_properties=device.description=Zoomy_Silent_Microphone')
+        if not source.strip().isdigit():
+            raise RuntimeError('Desktop uchun virtual mikrofon manbasi tayyorlanmadi.')
+        self.mic_source_module = source.decode().strip()
+        self.env['PULSE_SOURCE'] = mic+'_source'
         path = ROOT / '.runtime/zoom-desktop.log'
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         self.log = os.fdopen(fd, 'w')
@@ -414,7 +445,15 @@ class NativeZoom:
     async def snapshot(self):
         if self.process and self.process.returncode is not None:
             return 'ended' if self.admitted and self.process.returncode == 0 else 'disconnected'
-        window_ids = (await self.command('xdotool', 'search', '--onlyvisible', '--class', 'zoom')).decode().split()
+        class_ids = (await self.command('xdotool', 'search', '--onlyvisible', '--class', 'zoom')).decode().split()
+        # Qt can recreate its Meeting window with no matching WM_CLASS during
+        # admission. This display is dedicated to this one Zoom instance.
+        title_ids = (await self.command('xdotool','search','--onlyvisible','--name',
+                    '^(Zoom Workplace|Zoom Meeting.*|Zoom Webinar.*|Meeting|Webinar)$')).decode().split()
+        window_ids = list(dict.fromkeys(class_ids + title_ids))
+        if self.meeting_window_id and self.meeting_window_id not in window_ids:
+            self.meeting_window_id = None
+            self._fullscreen_window_id = None
         meeting_window = self.meeting_window_id is not None and self.meeting_window_id in window_ids
         main_candidates = []
         audio_dialog = False
@@ -425,7 +464,7 @@ class NativeZoom:
             is_audio = bool(re.search(r'(?:audio conference options|join audio)', title, re.I))
             owner = transient_parent(self.display,wid) if wid != self.meeting_window_id else None
             owned_modal = owner is not None and (owner==self.meeting_window_id or owner in window_ids)
-            prejoin_window = not self.admitted and title.casefold() != 'zoom workplace'
+            prejoin_window = not self.admitted
             if is_audio or title.casefold() == 'zoom' or owned_modal or prejoin_window:
                 audio_dialog = audio_dialog or is_audio
                 geometry=(await self.command('xdotool','getwindowgeometry','--shell',wid)).decode()
@@ -433,12 +472,13 @@ class NativeZoom:
                 if len(values)==4:
                     x,y,w,h=(int(values[k]) for k in ('X','Y','WIDTH','HEIGHT'))
                     if 0<=x<x+w<=1920 and 0<=y<y+h<=1200 and (self.admitted or w*h<1920*1200*.85):
-                        popup_regions.append((x,y,x+w,y+h))
+                        if (x,y,x+w,y+h) not in popup_regions:
+                            popup_regions.append((x,y,x+w,y+h))
                         if is_audio:
                             self.audio_window_rect=(x,y,x+w,y+h)
             if title.casefold() == 'zoom workplace':
                 main_candidates.append(wid)
-            if re.fullmatch(r'Zoom (Meeting|Webinar)(?:\s.*)?', title, re.I):
+            if re.fullmatch(r'(?:Zoom )?(Meeting|Webinar)(?:\s.*)?', title, re.I):
                 meeting_window = True
                 if self.meeting_window_id != wid:
                     self._share_panel_hidden = False
@@ -452,6 +492,26 @@ class NativeZoom:
             await self.park_pointer()
             logger.info('Native pre-join preview: Join selected without account sign-in')
             return 'connecting'
+        # The welcome/join window may cover a live meeting. Look behind it
+        # before treating its controls as the end of a meeting.
+        candidates = list(dict.fromkeys(([self.meeting_window_id] if meeting_window else []) + main_candidates))
+        if (not self.preview_join and native_state(self.lines) in {'connecting','admitted'}
+                and (is_home_screen(self.lines) or (not self.meeting_window_id and len(candidates)>1))):
+            if time.monotonic()-self._last_window_probe >= 5:
+                self._last_window_probe = time.monotonic()
+                meeting_window = False
+                for wid in candidates[:6]:
+                    await self.activate_window(wid)
+                    await asyncio.sleep(.3)
+                    await self.read_screen(extra_regions=popup_regions)
+                    # Only actual visible meeting controls prove which window
+                    # to capture. A large Home window is never a substitute.
+                    if native_state(self.lines) == 'admitted' and await self.window_has_controls(wid):
+                        if self.meeting_window_id != wid:
+                            self._share_panel_hidden = False
+                        self.meeting_window_id = wid
+                        meeting_window = True
+                        break
         signature = next((label.strip().casefold() for label,_,y in self.lines if y < 150
                           and re.search(r"(?:['’]s\s+screen|you are viewing)",label,re.I)), None)
         self.share_seen = self.share_seen or signature is not None or any(
@@ -475,20 +535,28 @@ class NativeZoom:
             if terminal_region or not meeting_window:
                 self.terminal_reference = (self._last_screen_png, terminal_region or (0,0,1920,1200))
         if state == 'admitted':
-            self.admitted = True
-            # Recent Linux clients title the meeting "Zoom Workplace" too.
-            # Choose the largest owned window only after actual admission.
             if not self.meeting_window_id and main_candidates:
-                sizes = []
                 for wid in main_candidates:
-                    geometry = (await self.command('xdotool', 'getwindowgeometry', '--shell', wid)).decode()
-                    width = re.search(r'^WIDTH=(\d+)$', geometry, re.M)
-                    height = re.search(r'^HEIGHT=(\d+)$', geometry, re.M)
-                    if width and height:
-                        sizes.append((int(width[1])*int(height[1]),wid))
-                if sizes:
-                    self.meeting_window_id = max(sizes)[1]
+                    if await self.window_has_controls(wid):
+                        self.meeting_window_id = wid
+                        break
+            if self.meeting_window_id is None:
+                state = 'connecting'
+            else:
+                self.admitted = True
+        if state != self._last_state:
+            logger.info('Native Desktop state=%s (windows=%d, OCR lines=%d)', state, len(window_ids), len(state_lines))
+            self._last_state = state
         return state
+
+    async def window_has_controls(self, wid):
+        geometry=(await self.command('xdotool','getwindowgeometry','--shell',wid)).decode()
+        values=dict(re.findall(r'^(X|Y|WIDTH|HEIGHT)=(-?\d+)$',geometry,re.M))
+        if len(values)!=4:
+            return False
+        x,y,w,h=(int(values[k]) for k in ('X','Y','WIDTH','HEIGHT'))
+        lines=[line for line in self.lines if x<=line[1]<x+w and y<=line[2]<y+h]
+        return native_state(lines) == 'admitted'
 
     async def read_screen(self, margins_only=False, extra_regions=()):
         # Read controls/status, never infer host removal from meeting chat text.
@@ -499,6 +567,14 @@ class NativeZoom:
             self.lines = []
             return
         self._last_screen_png = image
+        if self.process is not None:
+            diagnostic = ROOT / '.runtime/zoom-last-screen.png'
+            try:
+                fd = os.open(diagnostic, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, 'wb') as output:
+                    output.write(image)
+            except OSError:
+                logger.warning('Could not save private Desktop diagnostic frame')
         from PIL import Image, ImageOps
         source = Image.open(io.BytesIO(image))
         # Once admitted, OCR only toolbar/status margins while a meeting window
@@ -514,6 +590,17 @@ class NativeZoom:
             image = out.getvalue()
         tsv = await self.command('tesseract', 'stdin', 'stdout', '-l', 'eng', '--psm', '11', 'tsv', input=image, timeout=12)
         self.lines = ocr_lines(tsv.decode(errors='replace'))
+        # Zoom can reuse the meeting window ID for its welcome screen. Its
+        # central controls disappear from margin OCR, so probe them separately.
+        # Never feed arbitrary slide text into the meeting-state classifier.
+        if margins_only and time.monotonic()-self._last_home_ocr >= 5:
+            self._last_home_ocr = time.monotonic()
+            full = await self.command('tesseract', 'stdin', 'stdout', '-l', 'eng',
+                                      '--psm', '11', 'tsv', input=self._last_screen_png, timeout=12)
+            home_lines = ocr_lines(full.decode(errors='replace'))
+            if is_home_screen(home_lines):
+                self.lines = home_lines
+                return
         async def enhanced(region,rect,scale,psm='11',button=False):
             if button:
                 region=ImageOps.invert(region.convert('L').point(lambda v:255 if v>200 else 0))
@@ -551,28 +638,80 @@ class NativeZoom:
                 for box in blue_audio_buttons(region,preview=True):
                     absolute=(rect[0]+box[0],rect[1]+box[1],rect[0]+box[2],rect[1]+box[3])
                     labels=await enhanced(region.crop(box),absolute,3,psm='7',button=True)
-                    self.preview_join=next(((x,y) for label,x,y in labels if re.fullmatch(r'join[.,]?',label.strip(),re.I)),None)
-        if self.admitted and self.share_seen:
-            from native_video import media_bounds
-            bounds = media_bounds(source)
+                    join=next(((x,y) for label,x,y in labels if re.fullmatch(r'join[.,]?',label.strip(),re.I)),None)
+                    if join:
+                        self.preview_join=join
+        if self.admitted:
+            from native_video import media_bounds, camera_bounds
+            bounds = media_bounds(source) if self.share_seen else camera_bounds(source)
             if bounds:
                 old = self._last_media_bounds
+                if old is None or any(abs(a-b)>max(12,b*.05) for a,b in zip(bounds[2:],old[2:])):
+                    logger.info('Native source size changed: %dx%d at (%d,%d)',bounds[2],bounds[3],bounds[0],bounds[1])
                 if old and any(abs(a-b)>max(12,b*.05) for a,b in zip(bounds[2:],old[2:])):
                     self._share_panel_hidden = False
                     self._last_view_attempt = float('-inf')
                 self._last_media_bounds = bounds
+
+    async def enter_passcode(self, passcode):
+        """Fill only a positively identified meeting passcode prompt."""
+        if (native_state(self.lines) != 'passcode_required' or not isinstance(passcode,str)
+                or not passcode or len(passcode)>256 or any(c in passcode for c in '\r\n')):
+            return False
+        field=next(((x,y) for label,x,y in self.lines
+                    if label.strip().casefold() == 'passcode'),None)
+        if field is None and self._last_screen_png:
+            # OCR often misses the faint placeholder. Locate the focused blue
+            # input outline directly below the confirmed passcode heading.
+            heading=next(((x,y) for label,x,y in self.lines
+                          if re.fullmatch(r'enter (?:the )?meeting passcode',label.strip(),re.I)),None)
+            if heading:
+                from PIL import Image, ImageChops
+                hx,hy=heading
+                rect=(max(0,hx-200),max(0,hy+20),min(1920,hx+300),min(1200,hy+140))
+                crop=Image.open(io.BytesIO(self._last_screen_png)).convert('RGB').crop(rect)
+                r,g,b=crop.split()
+                mask=ImageChops.multiply(r.point(lambda v:255 if v<120 else 0),
+                                        b.point(lambda v:255 if v>160 else 0))
+                mask=ImageChops.multiply(mask,g.point(lambda v:255 if 45<v<195 else 0))
+                box=mask.getbbox()
+                if box and 100<=box[2]-box[0]<=500 and 20<=box[3]-box[1]<=90:
+                    field=(rect[0]+(box[0]+box[2])//2,rect[1]+(box[1]+box[3])//2)
+        if field is None:
+            return False
+        x,y=field
+        await self.command('xdotool','mousemove',str(x),str(y),'click','1',check=True)
+        await self.command('xdotool','key','--clearmodifiers','ctrl+a',check=True)
+        await self.command('xdotool','type','--clearmodifiers','--file','-',input=passcode.encode(),check=True)
+        await self.command('xdotool','key','--clearmodifiers','Return',check=True)
+        await self.park_pointer()
+        return True
 
     async def park_pointer(self):
         # The bottom/right edges reveal Zoom's auto-hidden controls. The
         # pointer itself is excluded by FFmpeg; leave it on the content edge.
         await self.command('xdotool', 'mousemove', '4', '600')
 
+    async def audio_dialog_visible(self):
+        ids=(await self.command('xdotool','search','--onlyvisible','--name',
+                                'Choose one of the audio conference options')).decode().split()
+        self.audio_window_rect = None
+        if ids:
+            geometry=(await self.command('xdotool','getwindowgeometry','--shell',ids[0])).decode()
+            values=dict(re.findall(r'^(X|Y|WIDTH|HEIGHT)=(-?\d+)$',geometry,re.M))
+            if len(values)==4:
+                x,y,w,h=(int(values[k]) for k in ('X','Y','WIDTH','HEIGHT'))
+                if 0<=x<x+w<=1920 and 0<=y<y+h<=1200:
+                    self.audio_window_rect=(x,y,x+w,y+h)
+        return bool(ids)
+
     async def join_computer_audio(self, refresh=True):
         """Positive Join actions only; never open the speaker/mic test wizard."""
+        visible = await self.audio_dialog_visible()
         if refresh:
             await self.read_screen()
         footer = next(((x,y) for label,x,y in self.lines
-                       if label.strip().casefold() == 'join audio' and y > 1120), None)
+                       if label.strip().casefold() == 'join audio'), None)
         if footer:
             await self.command('xdotool', 'mousemove', str(footer[0]), str(footer[1]), 'click', '1')
             await asyncio.sleep(0.3)
@@ -584,18 +723,80 @@ class NativeZoom:
             x, y = join
             await self.command('xdotool', 'mousemove', str(x), str(y), 'click', '1')
             await self.park_pointer()
-            self.audio_window_rect = None
             # Refresh before any Mute action: the footer may just have changed.
             await asyncio.sleep(0.3)
+            visible = await self.audio_dialog_visible()
             await self.read_screen()
-            self.audio_dialog_open = any('test speaker and microphone' in label.lower()
+            self.audio_dialog_open = visible or any('test speaker and microphone' in label.lower()
                      or re.fullmatch(r'(?:join\s+)?with computer audio|join with computer audio',label.strip(),re.I)
                      for label, _, _ in self.lines)
             return not self.audio_dialog_open
-        self.audio_dialog_open = any('test speaker and microphone' in label.lower()
-                     or label.strip().casefold() == 'join audio' and y > 1120
+        self.audio_dialog_open = visible or any('test speaker and microphone' in label.lower()
+                     or label.strip().casefold() == 'join audio'
                      for label, _, y in self.lines)
         return not self.audio_dialog_open
+
+    async def audio_output_ready(self):
+        """Verify only Zoom playback streams owned by this X display."""
+        try:
+            sinks=json.loads((await self.command('pactl','-f','json','list','sinks')).decode())
+            streams=json.loads((await self.command('pactl','-f','json','list','sink-inputs')).decode())
+        except (ValueError,UnicodeError):
+            return False
+        target=next((sink['index'] for sink in sinks if sink.get('name')==self.sink),None)
+        owned=[]
+        for stream in streams:
+            properties=stream.get('properties',{})
+            display=properties.get('window.x11.display','').split('.')[0]
+            if properties.get('application.process.binary')=='zoom' and display==self.display.split('.')[0]:
+                owned.append(stream)
+        return target is not None and bool(owned) and all(stream.get('sink')==target for stream in owned)
+
+    async def ensure_audio_output(self):
+        if await self.audio_output_ready():
+            return True
+        # Zoom may pin its playback stream and reject pactl move-sink-input.
+        # Select our sink using Zoom's own speaker menu instead of changing
+        # the server-wide default or capturing another application's output.
+        if not self.meeting_window_id:
+            logger.warning('Speaker selection: meeting window not resolved')
+            return False
+        geometry=(await self.command('xdotool','getwindowgeometry','--shell',self.meeting_window_id)).decode()
+        values=dict(re.findall(r'^(X|Y|WIDTH|HEIGHT)=(-?\d+)$',geometry,re.M))
+        if len(values)!=4:
+            logger.warning('Speaker selection: window %s geometry unavailable',self.meeting_window_id)
+            return False
+        left,top,width,height=(int(values[k]) for k in ('X','Y','WIDTH','HEIGHT'))
+        await self.command('xdotool','mousemove',str(left+50),str(top+height-20))
+        await asyncio.sleep(.3)
+        await self.read_screen()
+        footer=next(((x,y) for label,x,y in self.lines
+                     if label.strip().casefold() in {'audio','mute','unmute'}
+                     and left<=x<left+160 and top+height-80<y<top+height),None)
+        if footer is None:
+            logger.warning('Speaker selection: Audio footer not visible (window=%s, size=%sx%s, OCR lines=%d)',self.meeting_window_id,width,height,len(self.lines))
+            return False
+        x,y=footer
+        await self.command('xdotool','mousemove',str(x+28),str(y-26),'click','1')
+        await asyncio.sleep(.3)
+        await self.read_screen()
+        speaker=next(((px,py) for label,px,py in self.lines
+                      if label.strip()==self.sink and left<=px<left+360 and top<py<y),None)
+        if speaker is None:
+            logger.warning('Speaker selection: %s missing from opened menu',self.sink)
+            await self.command('xdotool','mousemove',str(x+28),str(y-26),'click','1')
+            await self.park_pointer()
+            return False
+        px,py=speaker
+        await self.command('xdotool','mousemove',str(px),str(py),'click','1')
+        await self.park_pointer()
+        for _ in range(3):
+            await asyncio.sleep(.3)
+            if await self.audio_output_ready():
+                logger.info('Native Zoom speaker verified: %s',self.sink)
+                return True
+        logger.warning('Speaker selection: playback still not routed to %s',self.sink)
+        return False
 
     async def close_auxiliary_windows(self):
         """Close only named auxiliary Zoom windows, never the meeting itself."""
@@ -653,11 +854,18 @@ class NativeZoom:
         finally:
             await self.park_pointer()
 
+    async def activate_window(self, wid):
+        # --sync can wait forever for a Qt window that won't take focus.
+        # Raising it is sufficient for screen capture even without keyboard focus.
+        await self.command('xdotool', 'windowactivate', wid)
+        await self.command('xdotool', 'windowraise', wid)
+
     async def ensure_fullscreen(self):
         wid = self.meeting_window_id
         if wid and wid != self._fullscreen_window_id and shutil.which('wmctrl'):
             # Set state explicitly. Alt+F is a Windows shortcut and blindly
             # toggling full screen can shrink an already-full-screen meeting.
+            await self.activate_window(wid)
             await self.command('wmctrl', '-i', '-r', hex(int(wid)), '-b', 'add,fullscreen')
             self._fullscreen_window_id = wid
 
@@ -679,6 +887,21 @@ class NativeZoom:
             await self.clean_shared_view()
         except Exception:
             logger.warning('Could not apply native view preferences; preserving the full frame')
+        for attempt in range(3):
+            if self.stop_event.is_set():
+                return
+            if await self.ensure_audio_output():
+                break
+            if attempt < 2:
+                # Admission replaces Qt windows and audio streams asynchronously.
+                # Re-resolve both instead of failing on the first partial frame.
+                await asyncio.sleep(.7)
+                state = await self.snapshot()
+                if state in {'ended','removed'}:
+                    raise RuntimeError('Audio tayyorlanayotganda konferensiya tugadi yoki kirish rad etildi.')
+                await self.ensure_fullscreen()
+        else:
+            raise RuntimeError('Zoom ovozi yozuv qurilmasiga yo‘naltirilmadi; ovozsiz yozuv boshlanmadi.')
         await self.park_pointer()
         # Give Zoom's own auto-hide setting time to clear the toolbar before
         # FFmpeg starts. /stop remains responsive during this short wait.
@@ -725,6 +948,9 @@ class NativeZoom:
                            str(exc) if isinstance(exc, AuthStoreError) else type(exc).__name__)
         finally:
             await self.auth_store.close()
+        if self.mic_source_module:
+            await self.command('pactl','unload-module',self.mic_source_module)
+            self.mic_source_module = None
         if self.mic_module:
             await self.command('pactl', 'unload-module', self.mic_module)
             self.mic_module = None

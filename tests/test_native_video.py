@@ -10,7 +10,7 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bot'))
-from native_video import media_bounds, clean_recording, TerminalMatcher
+from native_video import media_bounds, camera_bounds, clean_recording, TerminalMatcher
 
 
 def frame(landscape=False):
@@ -25,6 +25,25 @@ def frame(landscape=False):
     for x,y,color in ((left,top,'red'), (right-14,top,'blue'),
                       (left,bottom-14,'yellow'),(right-14,bottom-14,'magenta')):
         draw.rectangle((x,y,x+14,y+14),fill=color)
+    return image
+
+
+def camera_frame(camera_on=True, landscape=False):
+    image=Image.new('RGB',(640,400),'black')
+    draw=ImageDraw.Draw(image)
+    draw.rectangle((0,0,639,20),fill=(40,40,40))
+    draw.rectangle((280,25,360,60),fill=(20,24,27))
+    draw.ellipse((308,30,332,54),fill=(100,100,100))
+    draw.rectangle((40,65,600,375),fill=(17,21,24))
+    if camera_on:
+        left,right=(42,598) if landscape else (232,408)
+        draw.rectangle((left,66,right,374),fill=(40,180,80))
+        draw.rectangle((left,66,left+14,80),fill='red')
+        draw.rectangle((right-14,360,right,374),fill='magenta')
+    else:
+        draw.ellipse((302,202,338,238),fill=(200,80,20))
+    draw.rectangle((80,385,100,395),fill='white')
+    draw.rectangle((560,385,580,395),fill='white')
     return image
 
 
@@ -49,6 +68,19 @@ def end_frame():
 
 
 class GeometryTests(unittest.TestCase):
+    def test_camera_removes_charcoal_bars_bot_tile_and_toolbar(self):
+        x,y,w,h=camera_bounds(camera_frame())
+        self.assertGreaterEqual(x,230)
+        self.assertLessEqual(x,234)
+        self.assertGreater(y,60)
+        self.assertGreaterEqual(x+w,408)
+        self.assertLess(x+w,415)
+        self.assertGreaterEqual(y+h,374)
+        self.assertLess(y+h,380)
+
+    def test_camera_off_avatar_is_not_mistaken_for_camera_bounds(self):
+        self.assertIsNone(camera_bounds(camera_frame(False)))
+
     def test_portrait_excludes_header_toolbar_and_side_panel(self):
         image=frame()
         ImageDraw.Draw(image).rectangle((540,40,639,375),fill=(60,60,60))
@@ -121,8 +153,7 @@ class EncodeTests(unittest.TestCase):
             self.assertTrue(outcome.startswith('cleaned:'),outcome)
             after=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_streams','-of','json',str(path)]))
             video=next(s for s in after['streams'] if s['codec_type']=='video')
-            self.assertLess(video['width'],220)
-            self.assertGreater(video['height'],330)
+            self.assertEqual((video['width'],video['height']),(1920,1080))
             self.assertAlmostEqual(float(video['duration']),4,delta=.2)
             self.assertEqual(next(s for s in before['streams'] if s['codec_type']=='audio')['duration'],
                              next(s for s in after['streams'] if s['codec_type']=='audio')['duration'])
@@ -135,6 +166,51 @@ class EncodeTests(unittest.TestCase):
                                   lambda r,g,b:r>140 and g>140 and b<100,
                                   lambda r,g,b:r>140 and b>100 and g<100):
                     self.assertTrue(any(predicate(*p) for p in pixels),f'corner missing at {timestamp}')
+
+    def test_camera_crop_stays_clean_across_leading_and_long_camera_off_intervals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'camera.mp4'
+            source=b''.join(camera_frame(camera_on=6<=index<12).tobytes() for index in range(24))
+            subprocess.run(['ffmpeg','-v','error','-y','-f','rawvideo','-pix_fmt','rgb24',
+                '-s','640x400','-r','6','-i','-','-f','lavfi','-i','sine=frequency=440:sample_rate=48000',
+                '-t','4','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-c:a','aac',str(path)],
+                input=source,check=True)
+            result=clean_recording(path,camera_view=True)
+            self.assertTrue(result.startswith('cleaned:'),result)
+            info=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_streams','-of','json',str(path)]))
+            video=next(s for s in info['streams'] if s['codec_type']=='video')
+            audio=next(s for s in info['streams'] if s['codec_type']=='audio')
+            self.assertEqual((video['width'],video['height']),(1920,1080))
+            self.assertEqual(int(video['nb_frames']),24)
+            self.assertAlmostEqual(float(video['duration']),4,delta=.02)
+            self.assertAlmostEqual(float(audio['duration']),4,delta=.05)
+
+    def test_camera_rotation_uses_fixed_wide_black_canvas_without_losing_corners(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'rotation.mp4'
+            source=b''.join(camera_frame(landscape=index>=12).tobytes() for index in range(24))
+            subprocess.run(['ffmpeg','-v','error','-y','-f','rawvideo','-pix_fmt','rgb24',
+                '-s','640x400','-r','6','-i','-','-f','lavfi','-i','sine=frequency=440:sample_rate=48000',
+                '-t','4','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-c:a','aac',str(path)],
+                input=source,check=True)
+            result=clean_recording(path,camera_view=True)
+            self.assertTrue(result.startswith('cleaned:'),result)
+            video=json.loads(subprocess.check_output(['ffprobe','-v','error','-select_streams','v:0',
+                '-show_entries','stream=width,height,nb_frames','-of','json',str(path)]))['streams'][0]
+            self.assertEqual((video['width'],video['height']),(1920,1080))
+            self.assertEqual(int(video['nb_frames']),24)
+            raw=subprocess.check_output(['ffmpeg','-v','error','-ss','3','-i',str(path),
+                '-frames:v','1','-threads','1','-f','rawvideo','-pix_fmt','rgb24','-'])
+            image=Image.frombytes('RGB',(video['width'],video['height']),raw)
+            r,g,b=image.getpixel((image.width//2,20))
+            self.assertGreater(g,120)  # landscape fills the wide canvas without Zoom UI
+            portrait_raw=subprocess.check_output(['ffmpeg','-v','error','-ss','1','-i',str(path),
+                '-frames:v','1','-threads','1','-f','rawvideo','-pix_fmt','rgb24','-'])
+            portrait=Image.frombytes('RGB',(video['width'],video['height']),portrait_raw)
+            self.assertLess(max(portrait.getpixel((20,portrait.height//2))),10)
+            pixels=list(zip(raw[::3],raw[1::3],raw[2::3]))
+            self.assertTrue(any(r>150 and g<100 and b<100 for r,g,b in pixels))
+            self.assertTrue(any(r>140 and b>100 and g<100 for r,g,b in pixels))
 
     def test_uncertain_video_is_kept_byte_for_byte(self):
         with tempfile.TemporaryDirectory() as directory:

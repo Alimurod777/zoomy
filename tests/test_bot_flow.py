@@ -82,6 +82,14 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('secret', str(self.context.bot.send_message.call_args_list))
         self.assertFalse(bot.store.has_pending(7))
 
+    async def test_auto_setup_requests_password_when_link_does_not_include_it(self):
+        self.context.args=['https://zoom.us/j/97856007427']
+        with patch.dict(os.environ,AUTO_RECORD_SETUP='true'), \
+             patch.object(bot,'_launch_recording',new=AsyncMock()) as launch:
+            await bot.cmd_record(self.update,self.context)
+        launch.assert_not_awaited()
+        self.assertEqual(bot.store.get_pending(7)['state'],'input_pwd')
+
     async def test_auto_setup_after_record_prompt_also_starts_immediately(self):
         self.message.text = 'https://zoom.us/j/97856007427?pwd=secret'
         bot.store.set_pending(7, dict(state='input_url', timeout_task=None))

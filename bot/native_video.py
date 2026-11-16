@@ -1,4 +1,4 @@
-"""Conservative native shared-screen framing, performed after capture.
+"""Native presenter-camera and shared-screen framing after capture.
 
 Analyze every decoded frame before cropping: a phone rotation must never spend
 the next polling interval inside the old portrait crop. The original recording
@@ -16,7 +16,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from PIL import Image, ImageStat
+from PIL import Image, ImageStat, ImageChops
 
 
 class TerminalMatcher:
@@ -48,7 +48,7 @@ class TerminalMatcher:
         return error<=12 and ink_matches/len(self.ink)>=.9
 
 
-def media_bounds(image):
+def media_bounds(image, padding=2):
     """Find one large rectangular central surface, rejecting thin toolbars.
 
     Uniform black margins separate the source from Zoom's headers, footers,
@@ -105,15 +105,40 @@ def media_bounds(image):
     if not candidates:
         return None
     _, left, top, right, bottom = max(candidates)
-    # Expand by two thumbnail pixels, round outward for the original frame.
-    x = max(0, math.floor((left-2)*original_w/320/2)*2)
-    y = max(0, math.floor((top-2)*original_h/200/2)*2)
-    end_x = min(original_w, math.ceil((right+2)*original_w/320/2)*2)
-    end_y = min(original_h, math.ceil((bottom+2)*original_h/200/2)*2)
+    # Expand by the requested thumbnail padding and round outward.
+    x = max(0, math.floor((left-padding)*original_w/320/2)*2)
+    y = max(0, math.floor((top-padding)*original_h/200/2)*2)
+    end_x = min(original_w, math.ceil((right+padding)*original_w/320/2)*2)
+    end_y = min(original_h, math.ceil((bottom+padding)*original_h/200/2)*2)
     return (x, y, end_x-x, end_y-y)
 
 
-def clean_recording(path, terminal_reference=None, terminal_region=None, keep_full_view=False):
+def camera_bounds(image):
+    """Find the central camera image inside Zoom's dark speaker-view panel.
+
+    Treat Zoom's charcoal padding as background. Small avatar tiles and footer
+    icons fail the large central-rectangle checks used for screen shares.
+    """
+    width,height=image.size
+    small=image.convert('RGB').resize((320,200),Image.Resampling.NEAREST)
+    red,green,blue=small.split()
+    maximum=ImageChops.lighter(ImageChops.lighter(red,green),blue)
+    minimum=ImageChops.darker(ImageChops.darker(red,green),blue)
+    neutral=ImageChops.subtract(maximum,minimum).point(lambda value:255 if value<=25 else 0)
+    dark=maximum.point(lambda value:255 if value<=45 else 0)
+    foreground=ImageChops.invert(ImageChops.multiply(neutral,dark))
+    box=media_bounds(foreground.convert('RGB'),padding=0)
+    if not box:
+        return None
+    x,y,w,h=box
+    left=math.floor(x*width/320/2)*2
+    top=math.floor(y*height/200/2)*2
+    right=min(width,math.ceil((x+w)*width/320/2)*2)
+    bottom=min(height,math.ceil((y+h)*height/200/2)*2)
+    return left,top,right-left,bottom-top
+
+
+def clean_recording(path, terminal_reference=None, terminal_region=None, keep_full_view=False, camera_view=False):
     """Two bounded-memory passes, atomic replace on success only."""
     probe = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
                     '-show_entries', 'stream=width,height,r_frame_rate:format=duration', '-of', 'json', str(path)]))
@@ -148,7 +173,7 @@ def clean_recording(path, terminal_reference=None, terminal_region=None, keep_fu
                 else:
                     terminal_start = None
                 # Scale the padded box back to the actual capture dimensions.
-                box = media_bounds(thumbnail) if not keep_full_view else None
+                box = (camera_bounds(thumbnail) if camera_view else media_bounds(thumbnail)) if not keep_full_view else None
                 if box:
                     x,y,w,h = box
                     left = max(0, math.floor(x*width/320/2)*2)
@@ -159,9 +184,9 @@ def clean_recording(path, terminal_reference=None, terminal_region=None, keep_fu
                     first = first or box
                     detected += 1
                 else:
-                    # Never retain an old portrait crop after a rotation or
-                    # an ambiguous/dark frame: preserve the complete input.
-                    box = (0,0,width,height)
+                    # Shared views preserve the full input on ambiguity.
+                    # Camera-off intervals retain the confirmed presenter area.
+                    box = first if camera_view and first else (0,0,width,height)
                 if regions and all(abs(a-b) <= 12 for a,b in zip(box,regions[-1][1])):
                     # Merge minor border jitter by expanding outward. This
                     # avoids re-encoding a separate part for every pixel.
@@ -191,12 +216,16 @@ def clean_recording(path, terminal_reference=None, terminal_region=None, keep_fu
             frames,detected = terminal_start
             regions = [(start,box) for start,box in regions if start<frames]
             trimmed = True
-        if not first or not frames or detected / frames < 0.6 or keep_full_view:
+        if not first or not frames or (not camera_view and detected / frames < 0.6) or keep_full_view:
             if not trimmed:
                 return 'uncertain'
             first = (0,0,width,height)
             regions = [(0,first)]
-        out_w, out_h = first[2:]
+        if camera_view and not keep_full_view and first != (0,0,width,height):
+            # Leading camera-off frames use the first confirmed camera area.
+            # Keep their audio/timing; never expose the bot tile or toolbars.
+            regions=[(start,first if box==(0,0,width,height) else box) for start,box in regions]
+        out_w, out_h = ((1920,1080) if not keep_full_view and first != (0,0,width,height) else first[2:])
         # Encode constant-geometry intervals. Runtime crop-size changes stall
         # downstream scale/pad on some project FFmpeg builds. Every interval
         # uses the same canvas and frame rate, so rotations concatenate safely.
@@ -249,11 +278,12 @@ if __name__ == '__main__':
     parser.add_argument('--terminal-reference',type=Path)
     parser.add_argument('--terminal-region',type=lambda value:tuple(map(int,value.split(','))))
     parser.add_argument('--keep-full-view',action='store_true')
+    parser.add_argument('--camera-view',action='store_true')
     args = parser.parse_args()
     if hasattr(os, 'nice'):
         os.nice(19)
     try:
-        print(clean_recording(args.path,args.terminal_reference,args.terminal_region,args.keep_full_view), flush=True)
+        print(clean_recording(args.path,args.terminal_reference,args.terminal_region,args.keep_full_view,args.camera_view), flush=True)
     except Exception as exc:
         print(type(exc).__name__, flush=True)
         raise SystemExit(1)
