@@ -234,6 +234,21 @@ class BrowserAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.evaluate('window.joins'),1)
         self.assertEqual(await self.page.evaluate('window.mutes'),1)
 
+    async def test_guest_signin_wall_hands_over_to_saved_login_in_auto_mode(self):
+        async def route(r):
+            await r.fulfill(body='<p>This meeting requires participants to be signed in.</p>'
+                                 '<input type="text" id="email"><button type="submit">Sign In</button>',
+                            content_type='text/html')
+        await self.page.route(URL,route)
+        recorder=ZoomRecorder(on_error=AsyncMock())
+        recorder._join_mode='auto'
+        recorder._signed_in=False
+        with self.assertRaises(recorder_module.WebAuthRequired):
+            await recorder._open_join_page(self.page,URL)
+        self.assertFalse(recorder._stop_event.is_set())
+        recorder.on_error.assert_not_awaited()
+        self.assertEqual(await self.page.locator('#email').input_value(),'')
+
     async def test_current_waiting_room_copy_is_not_a_missing_join_form(self):
         async def route(r):
             await r.fulfill(body="<div class='speaker-active-container__wrap'><video></video></div><p>Host has joined. We've let them know you're here.</p>",content_type='text/html')
