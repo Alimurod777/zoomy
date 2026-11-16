@@ -2057,6 +2057,12 @@ class ZoomRecorder:
         # JOIN_SELECTORS ('button[type="submit"]') would then submit it, firing
         # junk login attempts at Zoom before the loop below noticed.
         if await self._check_signin_required(page):
+            if (self._join_mode or mode_for(self.user_id)) == 'auto':
+                # Let _enter_web retry with the saved account login (or Desktop)
+                # instead of ending the session on the guest attempt.
+                logger.info('Sign-in wall as %s; trying the next join route',
+                            'account' if self._signed_in else 'guest')
+                raise self._join_exception('auth_required')
             await self._abort_signin_required(page)
             return
 
