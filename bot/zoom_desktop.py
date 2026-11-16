@@ -393,7 +393,9 @@ class NativeZoom:
 
     async def control_link(self):
         if not self.link:
-            self.link = NativeDesktopLink(self, ttl=900)
+            # No timeout: a new tunnel is slow to create, so the link lives
+            # exactly as long as this Zoom session; close() tears it down.
+            self.link = NativeDesktopLink(self, ttl=None)
             await self.link.open()
         return self.link.url
 
@@ -928,7 +930,10 @@ class NativeZoom:
                     if proc.returncode is None:
                         if proc is self.process:
                             graceful = False
-                        os.killpg(proc.pid, signal.SIGKILL)
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                         await proc.wait()
         # Zoom's CEF helpers can outlive the launcher and keep recreating cache
         # files in a guest HOME. Reap only this instance's remaining group.

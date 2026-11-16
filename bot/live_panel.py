@@ -80,6 +80,10 @@ class RecordingPanel:
             except RetryAfter as exc:
                 value=exc.retry_after
                 self.retry_delay=max(5,value.total_seconds() if hasattr(value,'total_seconds') else float(value))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Recording panel update failed")
 
     async def start(self):
         try:

@@ -17,6 +17,15 @@ from auth_store import auth_store
 
 ROOT = Path(__file__).resolve().parents[1]
 
+
+def novnc_root():
+    """Private runtime copy (no-root setups) or the system package (Docker)."""
+    for root in (ROOT / ".runtime/root/usr/share/novnc", Path("/usr/share/novnc")):
+        if (root / "core/rfb.js").is_file():
+            return root.resolve()
+    return (ROOT / ".runtime/root/usr/share/novnc").resolve()
+
+
 def available_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -26,7 +35,9 @@ def available_port():
 class BrowserLoginLink:
     def __init__(self, browser, ttl=900, on_saved=None):
         self.browser = browser
-        self.deadline = time.monotonic() + ttl
+        # ttl=None: valid until close(), e.g. for the length of a live meeting.
+        self.deadline = None if ttl is None else time.monotonic() + ttl
+        self.expiry = None
         self.token = secrets.token_urlsafe(32)
         self.password = secrets.token_urlsafe(6)
         self.on_saved = on_saved
@@ -42,12 +53,15 @@ class BrowserLoginLink:
         self.sockets = set()
         self.lock = asyncio.Lock()
 
+    def expired(self):
+        return self.deadline is not None and time.monotonic() >= self.deadline
+
     def application(self):
         @web.middleware
         async def gate(request, handler):
-            if not hmac.compare_digest(request.match_info.get("token", ""), self.token):
+            if not hmac.compare_digest(request.match_info.get("token", "").encode(), self.token.encode()):
                 raise web.HTTPNotFound()
-            if time.monotonic() >= self.deadline or self.saved is not None:
+            if self.expired() or self.saved is not None:
                 return web.json_response({"message": "Havola muddati tugagan yoki login saqlangan."}, status=410)
             origin = request.headers.get("Origin")
             if origin and urlparse(origin).netloc != request.host:
@@ -204,7 +218,7 @@ class BrowserLoginLink:
                     await session.detach()
 
     async def asset(self, request):
-        root = (ROOT / ".runtime/root/usr/share/novnc").resolve()
+        root = novnc_root()
         path = (root / request.match_info["path"]).resolve()
         if not path.is_relative_to(root) or not path.is_file():
             raise web.HTTPNotFound()
@@ -214,7 +228,12 @@ class BrowserLoginLink:
         ws = web.WebSocketResponse(protocols=("binary",), max_msg_size=4 * 1024 * 1024, heartbeat=30)
         await ws.prepare(request)
         self.sockets.add(ws)
-        reader, writer = await asyncio.open_connection("127.0.0.1", self.vnc_port)
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", self.vnc_port)
+        except OSError:
+            self.sockets.discard(ws)
+            await ws.close()
+            return ws
 
         async def to_vnc():
             async for message in ws:
@@ -323,11 +342,24 @@ class BrowserLoginLink:
         self.tunnel_reader = asyncio.create_task(watch())
         base = await asyncio.wait_for(ready, timeout=45)
         self.url = f"{base}/s/{self.token}/"
+        if self.deadline is not None:
+            self.expiry = asyncio.create_task(self._expire())
         return self.url
 
-    async def close(self):
+    async def _expire(self):
+        # The gate only checks new requests; an open noVNC session must end too.
+        await asyncio.sleep(max(0, self.deadline - time.monotonic()))
+        await self._close_sockets()
+
+    async def _close_sockets(self):
         for ws in tuple(self.sockets):
             await ws.close()
+
+    async def close(self):
+        if self.expiry and self.expiry is not asyncio.current_task():
+            self.expiry.cancel()
+            await asyncio.gather(self.expiry, return_exceptions=True)
+        await self._close_sockets()
         if self.runner:
             await self.runner.cleanup()
         for process in (self.tunnel, self.vnc):

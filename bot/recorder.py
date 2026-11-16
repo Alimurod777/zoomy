@@ -17,7 +17,6 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
 from playwright.async_api import async_playwright, Page
 from auth_store import auth_store
 from meeting_state import classify_meeting, SNAPSHOT_JS
-from zoom_profile import profile_name_from_page
 from join_modes import mode_for
 
 logger = logging.getLogger(__name__)
@@ -763,7 +762,8 @@ class ZoomRecorder:
                 await self.on_error(str(exc))
         finally:
             elapsed = self.recording_elapsed_secs()
-            self._stop_ffmpeg()
+            # wait() on a slow-flushing ffmpeg can take 15s; keep the loop responsive.
+            await asyncio.to_thread(self._stop_ffmpeg)
             # Concat can be lengthy for big files — keep the loop responsive.
             await asyncio.to_thread(self._finalize_segments)
             if (self.output_path and self.output_path.is_file() and not self._session_errored
@@ -1128,15 +1128,17 @@ class ZoomRecorder:
         """Start a new segment after a pause (called when audio returns)."""
         if not self._paused:
             return
+        seg = self._next_segment_path()
+        # Start the encoder before leaving the paused state: if it fails we stay
+        # paused (and retry on the next audio check) instead of "recording" nothing.
+        self._ffmpeg = self._start_ffmpeg(str(seg), self._chrome_height)
+        self._segments.append(seg)
         if self._pause_started is not None:
             self._paused_total += time.monotonic() - self._pause_started
             self._pause_started = None
         self._paused = False
         self._silence_state = "monitoring"
         self._snooze_until = 0.0
-        seg = self._next_segment_path()
-        self._segments.append(seg)
-        self._ffmpeg = self._start_ffmpeg(str(seg), self._chrome_height)
         logger.info("Recording resumed — new segment %s", seg.name)
 
     def _finalize_segments(self) -> None:
@@ -1911,11 +1913,16 @@ class ZoomRecorder:
         except asyncio.TimeoutError:
             logger.warning('Native framing deadline reached; complete original recording retained')
         finally:
-            if proc.returncode is None:
-                os.killpg(proc.pid, signal.SIGKILL)
-                await proc.wait()
-            if terminal_path:
-                terminal_path.unlink(missing_ok=True)
+            try:
+                if proc.returncode is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+            finally:
+                if terminal_path:
+                    terminal_path.unlink(missing_ok=True)
 
     async def _join_meeting(self, page: Page, web_url: str, resume_waiting_room: bool = False) -> bool:
         deadline = time.monotonic() + max(30, int(os.getenv("ZOOM_HOST_WAIT_SECONDS") or "7200"))
@@ -2225,6 +2232,8 @@ class ZoomRecorder:
                 self._resume_recording()
             if self.on_waiting:
                 await self.on_waiting("Ulanish tiklandi. Yozuv davom etyapti; uzilgan oraliq faylga qo‘shilmaydi.")
+            # The limit is for consecutive failures, not every drop in a long meeting.
+            self._reconnect_count = 0
             return page
         except Exception as exc:
             if self.on_error:
@@ -2334,12 +2343,17 @@ class ZoomRecorder:
         log_path = Path(output).parent / ".ffmpeg.log"
         self._ffmpeg_log = open(log_path, "w", encoding="utf-8")
         logger.info("FFmpeg log → %s", log_path)
-        return subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=self._ffmpeg_log,
-            stderr=self._ffmpeg_log,
-        )
+        try:
+            return subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=self._ffmpeg_log,
+                stderr=self._ffmpeg_log,
+            )
+        except Exception:
+            self._ffmpeg_log.close()
+            self._ffmpeg_log = None
+            raise
 
     def _stop_ffmpeg(self) -> None:
         if not self._ffmpeg:
@@ -2353,6 +2367,10 @@ class ZoomRecorder:
                 self._ffmpeg.wait(timeout=15)
             except (subprocess.TimeoutExpired, BrokenPipeError, OSError):
                 self._ffmpeg.kill()
+                try:
+                    self._ffmpeg.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         self._ffmpeg = None
         if self._ffmpeg_log:
             try:

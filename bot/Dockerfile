@@ -39,10 +39,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfontconfig1 \
     libglib2.0-0 \
     libnspr4 \
+    # Secret-link remote desktop for Zoom login (bot/login_link.py)
+    x11vnc \
+    novnc \
     # Misc
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Temporary public tunnel for the login link; same pinned build as
+# scripts/setup-login-link.sh (only published checksum is for amd64).
+RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+        curl -fsSL --retry 2 --max-time 120 -o /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-linux-amd64 \
+        && echo "1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872  /usr/local/bin/cloudflared" | sha256sum -c - \
+        && chmod +x /usr/local/bin/cloudflared; \
+    else \
+        echo "cloudflared not installed for $(dpkg --print-architecture); set ZOOM_LOGIN_MODE=telegram to log in through chat"; \
+    fi
 
 WORKDIR /app
 
