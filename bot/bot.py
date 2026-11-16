@@ -35,7 +35,7 @@ import summarizer as summarizer_mod
 import filebrowser as filebrowser_mod
 import youtube as youtube_mod
 import telegram_upload as telegram_upload_mod
-from auth_store import auth_store
+from auth_store import atomic_state_file, auth_store
 from zoom_auth_bot import zoom_auth_bot
 from zoom_app_auth import zoom_app_auth
 from join_modes import MODES, mode_for, set_mode
@@ -126,8 +126,9 @@ def _read_schedule_file() -> list[dict]:
 
 
 def _write_schedule_file(entries: list[dict]) -> None:
+    # Entries hold meeting URLs with passcodes: write atomically with 0600 permissions.
     try:
-        SCHEDULES_FILE.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_state_file(SCHEDULES_FILE, entries)
     except Exception as e:
         logger.warning("Could not write schedules file: %s", e)
 

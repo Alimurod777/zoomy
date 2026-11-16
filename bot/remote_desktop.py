@@ -29,8 +29,8 @@ def remote_desktop(enabled: bool, display: int = 90, web_port: int = 6080,
     if not enabled:
         yield
         return
-    root = Path(__file__).resolve().parents[1]
-    assets = root / ".runtime/root/usr/share/novnc"
+    from login_link import novnc_root
+    assets = novnc_root()
     for program in ("Xvfb", "x11vnc"):
         if not shutil.which(program):
             raise RuntimeError("Run bash scripts/setup-runtime.sh and source scripts/runtime-env.sh first")

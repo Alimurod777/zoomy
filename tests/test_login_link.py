@@ -4,7 +4,7 @@ import sys
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -36,6 +36,22 @@ class LoginLinkTests(unittest.IsolatedAsyncioTestCase):
         self.link.deadline = time.monotonic() - 1
         response = await self.client.get(self.base)
         self.assertEqual(response.status, 410)
+
+    async def test_session_link_without_ttl_never_expires(self):
+        link = BrowserLoginLink(self.browser, ttl=None)
+        self.assertIsNone(link.deadline)
+        self.assertFalse(link.expired())
+
+    async def test_expiry_closes_already_open_desktop_sessions(self):
+        socket = Mock(close=AsyncMock())
+        self.link.sockets.add(socket)
+        self.link.deadline = time.monotonic()
+        await self.link._expire()
+        socket.close.assert_awaited_once()
+
+    async def test_non_ascii_token_is_not_found(self):
+        response = await self.client.get("/s/%C3%A9/")
+        self.assertEqual(response.status, 404)
 
     async def test_other_origin_cannot_control_or_save_session(self):
         response = await self.client.post(self.base + "save", headers={"Origin": "https://example.com"})

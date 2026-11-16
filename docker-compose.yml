@@ -26,7 +26,8 @@ services:
       # Saved Zoom login (see bot/zoom_login.py) for hosts that require
       # signed-in participants. Mounted as a directory so a missing
       # zoom_state.json stays missing — Docker would turn a bind mount of an
-      # absent *file* into an empty directory of that name. Read-only: the bot
-      # only ever loads it.
-      - ./secrets:/secrets:ro
+      # absent *file* into an empty directory of that name. Writable: the
+      # /zoomlogin link and YouTube sign-in save their state here when
+      # MongoDB is not configured.
+      - ./secrets:/secrets
     shm_size: "2gb"

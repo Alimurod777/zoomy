@@ -393,7 +393,9 @@ class NativeZoom:
 
     async def control_link(self):
         if not self.link:
-            self.link = NativeDesktopLink(self, ttl=900)
+            # No timeout: a new tunnel is slow to create, so the link lives
+            # exactly as long as this Zoom session; close() tears it down.
+            self.link = NativeDesktopLink(self, ttl=None)
             await self.link.open()
         return self.link.url
 
