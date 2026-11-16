@@ -12,6 +12,16 @@ fi
 if [[ -d "$ZOOMY_ROOT/.runtime/root/usr/share/X11/xkb" ]]; then
     export XKB_CONFIG_ROOT="$ZOOMY_ROOT/.runtime/root/usr/share/X11/xkb"
 fi
+# Privately extracted tesseract/Mesa look in compiled-in /usr paths by default.
+for tessdata in "$ZOOMY_ROOT"/.runtime/root/usr/share/tesseract-ocr/*/tessdata; do
+    [[ -d "$tessdata" ]] && export TESSDATA_PREFIX="$tessdata"
+done
+if [[ -d "$ZOOMY_ROOT/.runtime/root/usr/share/glvnd/egl_vendor.d" ]]; then
+    export __EGL_VENDOR_LIBRARY_DIRS="$ZOOMY_ROOT/.runtime/root/usr/share/glvnd/egl_vendor.d"
+fi
+if [[ -d "$ZOOMY_ROOT/.runtime/root/usr/lib/x86_64-linux-gnu/dri" ]]; then
+    export LIBGL_DRIVERS_PATH="$ZOOMY_ROOT/.runtime/root/usr/lib/x86_64-linux-gnu/dri"
+fi
 export TMPDIR=/tmp
 mkdir -p "$PULSE_RUNTIME_PATH"
 chmod 700 "/tmp/zoomy-$(id -u)" "$PULSE_RUNTIME_PATH"
