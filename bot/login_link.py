@@ -45,7 +45,7 @@ class BrowserLoginLink:
     def application(self):
         @web.middleware
         async def gate(request, handler):
-            if not hmac.compare_digest(request.match_info.get("token", ""), self.token):
+            if not hmac.compare_digest(request.match_info.get("token", "").encode(), self.token.encode()):
                 raise web.HTTPNotFound()
             if time.monotonic() >= self.deadline or self.saved is not None:
                 return web.json_response({"message": "Havola muddati tugagan yoki login saqlangan."}, status=410)

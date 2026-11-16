@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import dateparser as dateparser_lib
 
 from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -282,7 +283,7 @@ async def _transcription_worker(bot) -> None:
         mp4_path, chat_id, session_key, model = await _transcription_queue.get()
         _transcription_busy = True
         is_retranscribe = session_key.startswith("retranscribe/")
-        label = session_key[len("retranscribe/"):] if is_retranscribe else f"Session {session_key}"
+        label = session_key[len("retranscribe/"):] if is_retranscribe else f"Session {session_key.split('-', 1)[0]}"
         verb = "Retranscribing" if is_retranscribe else "Transcribing"
 
         try:
@@ -353,7 +354,7 @@ async def _transcribe_timeout(
             logger.debug("Could not retire transcribe buttons for %s: %s", session_key, e)
     await bot.send_message(
         chat_id,
-        f"Auto-transcribing session {session_key} ({WHISPER_MODEL}). {_queue_status_str()}"
+        f"Auto-transcribing session {session_key.split('-', 1)[0]} ({WHISPER_MODEL}). {_queue_status_str()}"
     )
 
 
@@ -1341,7 +1342,8 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
             )
             return
         reason = "Meeting ended by host" if auto_ended else "Recording stopped"
-        session_key = str(session_num)
+        # Session numbers restart per user; a token keeps pending requests distinct.
+        session_key = f"{session_num}-{secrets.token_hex(4)}"
         _pending_transcriptions[session_key] = filename
 
         rows = []
@@ -1374,7 +1376,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
              else "Transkripsiya kerak bo‘lsa modelni tanlang. Avtomatik transkripsiya o‘chirilgan."),
             reply_markup=keyboard,
         )
-        asyncio.create_task(
+        _spawn_background(
             _transcribe_timeout(session_key, filename, chat_id, bot, msg.message_id)
         )
         if youtube_mod.is_configured() and Path(filename).exists():
@@ -1824,7 +1826,8 @@ async def _send_peek(session: RecordingSession, chat_id: int, bot):
     display = session.recorder.display
     # JPEG, not PNG: a 1920x1200 desktop PNG is several MB, which over a slow
     # uplink blew through Telegram's upload timeout and the peek never arrived.
-    tmp_path = Path(f"/tmp/peek_{chat_id}_{session.session_num}.jpg")
+    # Unique per call: silence warnings, hourly and manual peeks can overlap.
+    tmp_path = Path(f"/tmp/peek_{chat_id}_{session.session_num}_{secrets.token_hex(4)}.jpg")
     try:
         command = ["ffmpeg", "-y", "-f", "x11grab", "-draw_mouse", "0",
                    "-video_size", "1920x1200", "-i", display]
@@ -1844,8 +1847,9 @@ async def _send_peek(session: RecordingSession, chat_id: int, bot):
             logger.warning("peek ffmpeg failed (session %d): %s", session.session_num, stderr)
             await bot.send_message(chat_id, f"Session {session.session_num}: screenshot failed.")
             return None
-        name = html.escape(session.recorder.recording_prefix or "session")
-        url = html.escape(session.recorder.current_url or "—")
+        # Caption is sent as plain text, so no HTML escaping.
+        name = session.recorder.recording_prefix or "session"
+        url = session.recorder.current_url or "—"
         caption = (
             f"📸 Session {session.session_num} — {name}\n"
             f"⏱ {session.recorder.elapsed_str()} | 💾 {session.recorder.file_size_str()}\n"
@@ -2708,7 +2712,20 @@ async def _send_ai_message(chat_id: int, text: str, bot) -> None:
     for index, chunk in enumerate(chunks):
         if index:
             chunk = f"_(continued…)_\n\n{chunk}"
-        await bot.send_message(chat_id, chunk, parse_mode="Markdown")
+        await _send_markdown_or_plain(bot, chat_id, chunk)
+
+
+async def _send_markdown_or_plain(bot, chat_id: int, text: str):
+    """Send Markdown, falling back to plain text when Telegram rejects the entities.
+
+    LLM output often has stray `_`/`*`, and 4000-char chunking can split a span.
+    """
+    try:
+        return await bot.send_message(chat_id, text, parse_mode="Markdown")
+    except BadRequest as e:
+        if "parse entities" not in str(e).lower():
+            raise
+        return await bot.send_message(chat_id, text)
 
 
 def _start_summary_conversation(
@@ -2896,7 +2913,6 @@ async def cb_rt_send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("Summary file not found. Use 🤖 AI Summary to generate one.")
         return
 
-    txt_path = state["selected_file"].with_suffix(".txt")
     folder_name = folder.name
     summary = summary_path.read_text(encoding="utf-8")
 
@@ -2907,7 +2923,7 @@ async def cb_rt_send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for index, chunk in enumerate(full_text[i:i + 4000] for i in range(0, len(full_text), 4000)):
         if index:
             chunk = f"_(continued…)_\n\n{chunk}"
-        await context.bot.send_message(query.message.chat_id, chunk, parse_mode="Markdown")
+        await _send_markdown_or_plain(context.bot, query.message.chat_id, chunk)
 
 
 async def cb_rt_ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3134,6 +3150,9 @@ async def cb_rt_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not state or not state.get("selected_folder"):
         await query.edit_message_text("Session expired. Use /history to start again.")
         return
+    if store.is_active_folder(state["selected_folder"]):
+        await query.edit_message_text("⚠️ This recording is still active and cannot be renamed.")
+        return
     state["sub_state"] = "input_rename"
     state["pending_rename"] = None
     state["rename_msg_id"] = query.message.message_id
@@ -3312,27 +3331,34 @@ async def cb_rt_rename_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if store.is_active_folder(folder):
+        await query.edit_message_text("⚠️ This recording is still active and cannot be renamed.")
+        return
+
     # Determine file prefix change
     old_prefix = _extract_file_prefix(folder.name)
     new_prefix = _extract_file_prefix(new_name)
 
-    # Rename files with matching stem inside the folder first
-    rename_errors = []
-    if old_prefix != new_prefix:
-        for f in sorted(folder.iterdir()):
-            if f.is_file() and not f.name.startswith('.') and f.stem == old_prefix:
-                try:
-                    f.rename(f.parent / (new_prefix + f.suffix))
-                except Exception as e:
-                    rename_errors.append(f.name)
-                    logger.warning("Could not rename file %s: %s", f, e)
-
-    # Rename the folder itself
+    # Folder first: if it fails, nothing has changed yet.
     try:
         folder.rename(new_path)
     except Exception as e:
         await query.edit_message_text(f"⚠️ Rename failed: {e}")
         return
+
+    rename_errors = []
+    if old_prefix != new_prefix:
+        for f in sorted(new_path.iterdir()):
+            if f.is_file() and not f.name.startswith('.') and f.stem == old_prefix:
+                target = f.parent / (new_prefix + f.suffix)
+                if target.exists():
+                    rename_errors.append(f.name)
+                    continue
+                try:
+                    f.rename(target)
+                except Exception as e:
+                    rename_errors.append(f.name)
+                    logger.warning("Could not rename file %s: %s", f, e)
 
     # Update .metadata.json
     meta_path = new_path / ".metadata.json"

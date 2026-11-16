@@ -1,5 +1,4 @@
 """Editing controls on the real HTTP page; native keyboard calls remain offline."""
-import asyncio
 from pathlib import Path
 import sys
 import unittest

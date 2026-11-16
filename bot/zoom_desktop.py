@@ -928,7 +928,10 @@ class NativeZoom:
                     if proc.returncode is None:
                         if proc is self.process:
                             graceful = False
-                        os.killpg(proc.pid, signal.SIGKILL)
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                         await proc.wait()
         # Zoom's CEF helpers can outlive the launcher and keep recreating cache
         # files in a guest HOME. Reap only this instance's remaining group.
