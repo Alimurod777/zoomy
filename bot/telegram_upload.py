@@ -133,7 +133,9 @@ async def upload_recording(bot, chat_id: int, path: Path) -> list[int]:
                         info = await probe(part)
                         last_notice = 0.0
 
-                        async def progress(current, total):
+                        part_num = i + 1
+
+                        async def progress(current, total, _part=part_num):
                             nonlocal last_notice
                             now = time.monotonic()
                             if now - last_notice >= 30:
@@ -141,7 +143,7 @@ async def upload_recording(bot, chat_id: int, path: Path) -> list[int]:
                                 # Reporting failure must not abort the media upload.
                                 try:
                                     await bot.send_message(chat_id,
-                                        f"📤 Part {i + 1}/{len(parts)}: {current * 100 // max(total, 1)}%")
+                                        f"📤 Part {_part}/{len(parts)}: {current * 100 // max(total, 1)}%")
                                 except Exception:
                                     pass
 

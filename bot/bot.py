@@ -304,7 +304,7 @@ async def _transcription_worker(bot) -> None:
                     meta = json.loads(meta_path.read_text(encoding="utf-8"))
                     meta["transcript"] = {
                         "model": model,
-                        "transcribed_at": datetime.now().isoformat(),
+                        "transcribed_at": datetime.now(timezone.utc).isoformat(),
                     }
                     meta_path.write_text(
                         json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
