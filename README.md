@@ -3,7 +3,8 @@
 [O‘zbekcha loyiha izohi va mahalliy sozlash](docs/setup-uz.md)
 
 For Alwaysdata without root or Docker, use the `venv` and private runtime setup
-in that guide. It includes a temporary noVNC desktop over SSH for Zoom sign-in
+in that guide: `git clone`, `cd zoomy`, then `bash scripts/setup.sh` installs
+everything into the project. It includes a temporary noVNC desktop over SSH for Zoom sign-in
 and optional Pyrofork/MTProto uploads with playable MP4 splitting.
 
 A Telegram bot that records Zoom meetings through the Zoom Web App, using a guest or a saved Zoom login. With the optional native Linux client installed, app-only meetings can fall back to Zoom Desktop.

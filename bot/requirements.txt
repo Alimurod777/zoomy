@@ -9,7 +9,8 @@ google-api-python-client>=2.150
 google-auth>=2.35
 google-auth-oauthlib>=1.2
 pyrofork==2.3.69
-TgCrypto>=1.2.5
+# Same `tgcrypto` module as TgCrypto, but with wheels for Python 3.12+ (no compiler needed).
+TgCrypto-pyrofork>=1.2.8
 websockify>=0.12
 pymongo>=4.13,<5
 cryptography>=44

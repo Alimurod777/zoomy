@@ -1,0 +1,2 @@
+# Convenience entry point: the real list lives in bot/requirements.txt.
+-r bot/requirements.txt

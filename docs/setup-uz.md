@@ -227,17 +227,52 @@ to‘xtatildi. Yangi ekran ajratishda mavjud X serverning lock fayli o‘chirilm
 
 ## `venv` va root huquqisiz dasturlar
 
-Loyiha ildizidan (ushbu serverda allaqachon bajarilgan):
+Yangi serverda boshidan (SSH orqali; `ACCOUNT` — alwaysdata akkaunt nomi):
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-python -m pip install -r bot/requirements.txt
-python -m playwright install chromium
-bash scripts/setup-runtime.sh
-bash scripts/setup-mongodb.sh
-bash scripts/setup-login-link.sh
+ssh ACCOUNT@ssh-ACCOUNT.alwaysdata.net
+cd ~
+git clone https://github.com/Alimurod777/zoomy.git
+cd zoomy
+bash scripts/setup.sh
+nano .env                 # TELEGRAM_TOKEN, AUTHORIZED_USER_IDS, OWNER_TELEGRAM_ID
+bash scripts/run.sh       # sinov; to‘xtatish — Ctrl+C
 ```
+
+Papka allaqachon bo‘lsa `git clone` o‘rniga `cd ~/zoomy && git pull`, so‘ng yana
+`bash scripts/setup.sh`. Skript istalgan papkadan ishlaydi va qayta ishlatish
+xavfsiz: `venv` yaratadi, kutubxonalarni o‘rnatadi, Chromium, FFmpeg/Xvfb/
+PulseAudio va login havolasi uchun `cloudflared` ni yuklaydi, `.env` ni namunadan
+yaratadi (mavjudiga tegmaydi) va oxirida Services uchun aniq buyruqni chiqaradi.
+Panelda **Environment → Python** 3.10 yoki yangiroq bo‘lishi kerak.
+
+Kutubxonalar ro‘yxati `bot/requirements.txt` da; ildizdagi `requirements.txt`
+unga yo‘naltiradi, shuning uchun ikkala buyruq ham ishlaydi:
+
+```bash
+venv/bin/python -m pip install -r requirements.txt
+venv/bin/python -m pip install -r bot/requirements.txt
+```
+
+Qo‘lda, qadam-baqadam (`setup.sh` aynan shularni bajaradi):
+
+```bash
+python -m venv venv
+venv/bin/python -m pip install -r bot/requirements.txt
+venv/bin/python -m playwright install chromium
+bash scripts/setup-runtime.sh
+bash scripts/setup-login-link.sh
+bash scripts/setup-mongodb.sh      # ixtiyoriy: lokal MongoDB
+```
+
+| Xato | Yechim |
+| --- | --- |
+| `Could not open requirements file` | Buyruq loyiha papkasidan tashqarida ishlatilgan: `cd ~/zoomy` yoki `bash ~/zoomy/scripts/setup.sh`. |
+| `Python 3.10 yoki yangiroq kerak` | Panel → Environment → Python da 3.12 ni tanlang yoki `PYTHON_VERSION=3.12 bash scripts/setup.sh`. |
+| `Python.h: No such file` (`tgcrypto`) | Eski `venv`: `git pull && bash scripts/setup.sh` — endi tayyor wheel o‘rnatiladi, kompilyator kerak emas. |
+| Python versiyasi almashtirilgach bot ishlamaydi | `rm -rf venv && bash scripts/setup.sh`. |
+| `Set TELEGRAM_TOKEN ...` | `.env` to‘ldirilmagan. |
+| `Disk quota exceeded` | `du -sh ~/zoomy/* ~/.cache/*`; eski yozuvlarni `recordings/` dan o‘chiring, `rm -rf ~/.cache/pip`. |
 
 Setup skripti Debian 12 amd64 paketlarini rasmiy ombordan `.runtime/root`
 ichiga ochadi. Root, sudo va Docker kerak emas. FFmpeg/ffprobe, Xvfb,
